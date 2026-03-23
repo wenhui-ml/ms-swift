@@ -18,7 +18,7 @@
 
 PYTHON=/home/ubuntu/miniconda3/envs/wh-llm/bin/python
 SCRIPT=/home/ubuntu/wenhui/mag_gate/ms-swift/configs/create_mag_gated_model.py
-CKPT_DIR=/home/ubuntu/wenhui/mag_gate/ms-swift/model_checkpoints
+CKPT_DIR=/home/ubuntu/wenhui/mag_gate/ms-swift/model_checkpoints_2
 TOKENIZER=/home/ubuntu/llm_weights/Qwen3-0.6B
 
 echo "=========================================="

@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # ============================================================================
 # MagGated Transformer 从头预训练脚本
@@ -30,11 +31,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift pt \
     --model $MODEL_DIR \
     --tuner_type full \
-    --dataset HuggingFaceTB/cosmopedia:auto_math_text#100000 HuggingFaceTB/cosmopedia:khanacademy#100000 HuggingFaceTB/cosmopedia:openstax#100000 HuggingFaceTB/cosmopedia:stanford#100000 HuggingFaceTB/cosmopedia:stories#100000 HuggingFaceTB/cosmopedia:web_samples_v1#100000 HuggingFaceTB/cosmopedia:web_samples_v2#100000 HuggingFaceTB/cosmopedia:wikihow#100000 \
+    --dataset \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/fineweb_100k.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/skypile_60k.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_stanford.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_khan.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_math.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/starcoder_py.parquet \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/magpie_10k.parquet \
+    --streaming false \
     --torch_dtype bfloat16 \
-    --streaming true \
-    --per_device_train_batch_size 4 \
-    --per_device_eval_batch_size 4 \
+    --per_device_train_batch_size 2 \
+    --per_device_eval_batch_size 2 \
     --learning_rate 1e-5 \
     --gradient_accumulation_steps 16 \
     --eval_steps 100 \
