@@ -68,11 +68,19 @@ class MagGatedConfig(PretrainedConfig):
         mag_gate_positions="all",
         use_residual_gate=True,
         residual_gate_rank=16,
-        gate_init_bias=3.0,
+        gate_init_bias=0.0,
         gate_floor=0.05,
         use_weight_norm=False,
         use_gate_norm=True,
-        residual_gate_init_bias=4.0,
+        residual_gate_init_bias=3.0,
+        # Gate mode: "none" (recommended), "softmax", or "sigmoid" (legacy)
+        gate_mode="none",
+        gate_temperature=1.0,        # Temperature for softmax gate (lower = sharper)
+        # Gate auxiliary loss (only for sigmoid mode)
+        gate_loss_type="none",
+        gate_loss_weight=0.0,
+        gate_target_sparsity=0.4,
+        gate_grad_scale=1.0,
         # === Standard options ===
         attention_bias=False,
         mlp_bias=False,
@@ -103,6 +111,13 @@ class MagGatedConfig(PretrainedConfig):
         self.use_weight_norm = use_weight_norm
         self.use_gate_norm = use_gate_norm
         self.residual_gate_init_bias = residual_gate_init_bias
+        # Gate mode and parameters
+        self.gate_mode = gate_mode
+        self.gate_temperature = gate_temperature
+        self.gate_loss_type = gate_loss_type
+        self.gate_loss_weight = gate_loss_weight
+        self.gate_target_sparsity = gate_target_sparsity
+        self.gate_grad_scale = gate_grad_scale
         # Standard
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias

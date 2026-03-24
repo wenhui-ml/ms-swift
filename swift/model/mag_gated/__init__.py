@@ -6,7 +6,9 @@ from .modeling_mag_gated import (
     MagGatedModel,
     MagGatedDecoderLayer,
     MagGatedLinear,
+    ResidualGate,
 )
+from .gate_monitor_callback import MagGateMonitorCallback
 
 __all__ = [
     "MagGatedConfig",
@@ -14,4 +16,6 @@ __all__ = [
     "MagGatedModel",
     "MagGatedDecoderLayer",
     "MagGatedLinear",
+    "ResidualGate",
+    "MagGateMonitorCallback",
 ]
