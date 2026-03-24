@@ -1032,22 +1032,38 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
                     prefix = f"gate/layer{layer_idx}_{proj_name}"
                     _collect_mag_linear_stats(proj, prefix, layer_mag_means, layer_mag_stds)
 
-            # Residual gates — now fully tracked with sparsity/saturation
+            # Residual gates — dual-gate (α retain + β accept)
             if layer.use_residual_gate:
                 for gate_name in ["attn_residual_gate", "ffn_residual_gate"]:
                     gate = getattr(layer, gate_name, None)
                     if isinstance(gate, ResidualGate) and gate._gate_stats is not None:
-                        prefix = f"gate/layer{layer_idx}_{gate_name}"
-                        for k, v in gate._gate_stats.items():
-                            if k != "dim_mean":
-                                stats[f"{prefix}_{k}"] = v
-                        res_means.append(gate._gate_stats["mean"])
-                        if "sparsity" in gate._gate_stats:
-                            res_sparsities.append(gate._gate_stats["sparsity"])
-                        if "saturation" in gate._gate_stats:
-                            res_saturations.append(gate._gate_stats["saturation"])
-                        if "forget_ratio" in gate._gate_stats:
-                            res_forget_ratios.append(gate._gate_stats["forget_ratio"])
+                        gs = gate._gate_stats
+                        # α (retain gate) stats
+                        prefix_alpha = f"gate/layer{layer_idx}_{gate_name}"
+                        for k in ["mean", "std", "min", "max", "sparsity", "saturation"]:
+                            if k in gs:
+                                stats[f"{prefix_alpha}_{k}"] = gs[k]
+                        # β (accept gate) stats — stored with _beta suffix
+                        prefix_beta = f"gate/layer{layer_idx}_{gate_name}_beta"
+                        for k in ["beta_mean", "beta_std", "beta_sparsity", "beta_saturation"]:
+                            if k in gs:
+                                short_k = k.replace("beta_", "")
+                                stats[f"{prefix_beta}_{short_k}"] = gs[k]
+
+                        # Collect for global summary
+                        res_means.append(gs["mean"])
+                        if "sparsity" in gs:
+                            res_sparsities.append(gs["sparsity"])
+                        if "saturation" in gs:
+                            res_saturations.append(gs["saturation"])
+                        if "forget_ratio" in gs:
+                            res_forget_ratios.append(gs["forget_ratio"])
+
+                        # β global stats
+                        if "beta_mean" in gs:
+                            if "res_beta_means" not in locals():
+                                res_beta_means = []
+                            res_beta_means.append(gs["beta_mean"])
 
             # Per-layer summary
             if layer_mag_means:
@@ -1082,13 +1098,18 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
 
         # === Global ResidualGate summary (separate from MagGatedLinear) ===
         if res_means:
-            stats["gate/residual_global_mean"] = sum(res_means) / len(res_means)
+            stats["gate/residual_alpha_global_mean"] = sum(res_means) / len(res_means)
+            # Keep old key for backward compatibility
+            stats["gate/residual_global_mean"] = stats["gate/residual_alpha_global_mean"]
         if res_sparsities:
             stats["gate/residual_global_sparsity"] = sum(res_sparsities) / len(res_sparsities)
         if res_saturations:
             stats["gate/residual_global_saturation"] = sum(res_saturations) / len(res_saturations)
         if res_forget_ratios:
             stats["gate/residual_global_forget_ratio"] = sum(res_forget_ratios) / len(res_forget_ratios)
+        # β (accept gate) global summary
+        if "res_beta_means" in locals() and res_beta_means:
+            stats["gate/residual_beta_global_mean"] = sum(res_beta_means) / len(res_beta_means)
 
         # === Dimension reuse analysis ===
         # Analyze how dimensions are used across layers (key metric for the paper thesis)

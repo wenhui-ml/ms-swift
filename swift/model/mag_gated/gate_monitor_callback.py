@@ -118,8 +118,9 @@ class MagGateMonitorCallback(TrainerCallback):
         dim_active_ratio = gate_stats.get("gate/dim_active_ratio", -1)
         dim_reuse_score = gate_stats.get("gate/dim_reuse_score", -1)
 
-        # Residual gate stats
-        res_mean = gate_stats.get("gate/residual_global_mean", -1)
+        # Residual gate stats (dual-gate: α retain + β accept)
+        res_mean = gate_stats.get("gate/residual_global_mean", -1)  # α mean
+        res_beta_mean = gate_stats.get("gate/residual_beta_global_mean", -1)  # β mean
         res_forget = gate_stats.get("gate/residual_global_forget_ratio", -1)
 
         # Magnitude (m) stats
@@ -148,9 +149,11 @@ class MagGateMonitorCallback(TrainerCallback):
         if dim_reuse_score >= 0:
             msg += f" | dim_reuse={dim_reuse_score:.4f}"
 
-        # Add residual gate info if available
+        # Add residual gate info (dual-gate: α retain + β accept)
         if res_mean >= 0:
-            msg += f" | res_mean={res_mean:.4f}"
+            msg += f" | α_mean={res_mean:.4f}"
+        if res_beta_mean >= 0:
+            msg += f" | β_mean={res_beta_mean:.4f}"
         if res_forget >= 0:
             msg += f" | res_forget={res_forget:.4f}"
 
@@ -258,15 +261,16 @@ class MagGateMonitorCallback(TrainerCallback):
         lines.append(f"\n  Summary:")
         for key in ["gate/global_mean", "gate/global_std", "gate/global_sparsity",
                      "gate/global_saturation", "gate/dim_active_ratio", "gate/dim_reuse_score",
-                     "gate/residual_global_mean", "gate/residual_global_forget_ratio",
+                     "gate/residual_alpha_global_mean", "gate/residual_beta_global_mean",
+                     "gate/residual_global_forget_ratio",
                      "gate/residual_global_sparsity", "gate/residual_global_saturation"]:
             if key in gate_stats and isinstance(gate_stats[key], (int, float)):
                 short_key = key.replace("gate/", "")
                 lines.append(f"    {short_key:>35}: {gate_stats[key]:.6f}")
 
-        lines.append(f"\n  Dimension Analysis:")
-        lines.append(f"    Each MagGatedLinear has gate g(x) ∈ (0,1)^d_out — one gate per output dimension.")
-        lines.append(f"    Each ResidualGate has forget f(h) ∈ (0,1)^d — one gate per hidden dimension.")
+        lines.append(f"\n  Dual-Gate Analysis (h_new = α⊙h + β⊙o):")
+        lines.append(f"    α (retain gate): controls how much old info to keep per dimension")
+        lines.append(f"    β (accept gate): controls how much new info to accept per dimension")
 
         dim_active = gate_stats.get("gate/dim_active_ratio", -1)
         dim_reuse = gate_stats.get("gate/dim_reuse_score", -1)
