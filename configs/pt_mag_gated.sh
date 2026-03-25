@@ -12,8 +12,8 @@
 #   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L12 1000 4
 # ============================================================================
 
-MODEL_DIR=${1:-model_checkpoints/mag_gated-d512-L28}
-MAX_STEPS=${2:-10000}
+MODEL_DIR=${1:-model_checkpoints/mag_gated-d1024-L28}
+MAX_STEPS=${2:-3500}
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
@@ -49,7 +49,7 @@ swift pt \
     --save_steps 100 \
     --save_total_limit 5 \
     --logging_steps 5 \
-    --deepspeed zero0 \
+    --deepspeed zero1 \
     --max_length 4096 \
     --max_steps $MAX_STEPS \
     --warmup_ratio 0.05 \
@@ -63,4 +63,7 @@ swift pt \
     --lr_scheduler_type cosine \
     --use_hf true \
     --dataset_shuffle true \
-    --train_dataloader_shuffle true
+    --train_dataloader_shuffle true \
+    --attn_impl flash_attention_3 \
+    --packing true
+

@@ -11,10 +11,15 @@ where:
     g(x) = sigmoid(B(A(x))) = dynamic input-dependent gate
 
 This allows selective dimension activation, enabling smaller hidden sizes.
+
+Supports:
+- Flash Attention 2/3 via transformers ALL_ATTENTION_FUNCTIONS dispatch
+- Packing/padding_free training via FlashAttentionKwargs (cu_seq_lens_q/k)
+- SDPA, eager, flex_attention backends
 """
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -28,6 +33,36 @@ from transformers.modeling_outputs import (
 )
 from transformers.generation import GenerationMixin
 from transformers.utils import logging
+
+try:
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+except ImportError:
+    FlashAttentionKwargs = None
+
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = None
+
+try:
+    from transformers.masking_utils import create_causal_mask
+except ImportError:
+    create_causal_mask = None
+
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    GradientCheckpointingLayer = nn.Module
+
+try:
+    from transformers.processing_utils import Unpack
+except ImportError:
+    Unpack = None
+
+try:
+    from transformers.utils import TransformersKwargs
+except ImportError:
+    TransformersKwargs = None
 
 from .configuration_mag_gated import MagGatedConfig
 
@@ -407,6 +442,47 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads for GQA. (batch, num_kv_heads, seqlen, head_dim) ->
+    (batch, num_attention_heads, seqlen, head_dim)"""
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+# ==============================================================================
+# Eager attention fallback (used when _attn_implementation == "eager")
+# ==============================================================================
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """Eager attention implementation compatible with ALL_ATTENTION_FUNCTIONS dispatch."""
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
 # ==============================================================================
 # Attention
 # ==============================================================================
@@ -424,7 +500,12 @@ def _should_gate(name: str, positions: str) -> bool:
 
 
 class MagGatedAttention(nn.Module):
-    """Multi-head attention with optional MagGated projections."""
+    """Multi-head attention with optional MagGated projections.
+
+    Supports flash_attention_2, flash_attention_3, sdpa, eager, flex_attention
+    via transformers ALL_ATTENTION_FUNCTIONS dispatch mechanism.
+    This enables packing/padding_free training with cu_seq_lens.
+    """
 
     def __init__(self, config: MagGatedConfig, layer_idx: int):
         super().__init__()
@@ -435,7 +516,9 @@ class MagGatedAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
+        self.is_causal = True
 
         pos = config.mag_gate_positions
 
@@ -461,49 +544,48 @@ class MagGatedAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: tuple,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # GQA: repeat kv heads
-        if self.num_key_value_groups > 1:
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        # Use ALL_ATTENTION_FUNCTIONS dispatch if available (transformers >= 4.46)
+        # This enables flash_attention_2, flash_attention_3, sdpa, flex_attention, etc.
+        # and supports packing/padding_free via cu_seq_lens_q/k kwargs.
+        attention_interface: Callable = eager_attention_forward
+        if ALL_ATTENTION_FUNCTIONS is not None and self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # SDPA
-        attn_output = F.scaled_dot_product_attention(
+        attn_output, attn_weights = attention_interface(
+            self,
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None
+        return attn_output, attn_weights
 
 
 # ==============================================================================
@@ -548,8 +630,11 @@ class MagGatedMLP(nn.Module):
 # Decoder Layer
 # ==============================================================================
 
-class MagGatedDecoderLayer(nn.Module):
+class MagGatedDecoderLayer(GradientCheckpointingLayer):
     """Transformer decoder layer with MagGated Linear and residual gating.
+
+    Inherits from GradientCheckpointingLayer for automatic gradient checkpointing
+    support in transformers >= 4.46.
 
     Structure:
         h → norm1 → MagGated_Attn → [residual_gate] → h + attn_out
@@ -578,24 +663,23 @@ class MagGatedDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple] = None,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> torch.Tensor:
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self attention
+        # Self attention — pass **kwargs through for FlashAttentionKwargs
+        # (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
         attn_output, attn_weights = self.self_attn(
             hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
+            past_key_values=past_key_values,
             cache_position=cache_position,
             **kwargs,
         )
@@ -617,11 +701,7 @@ class MagGatedDecoderLayer(nn.Module):
         else:
             hidden_states = residual + ffn_output
 
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        return hidden_states
 
 
 # ==============================================================================
@@ -633,8 +713,14 @@ class MagGatedPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["MagGatedDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+
+    # === Enable flash attention and attention backend dispatch ===
+    _supports_flash_attn = True
     _supports_sdpa = True
+    _supports_flex_attn = True
     _supports_cache_class = True
+    _supports_attention_backend = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -671,6 +757,11 @@ class MagGatedModel(MagGatedPreTrainedModel):
             [MagGatedDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = MagGatedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = MagGatedRotaryEmbedding(
+            config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
 
         self.gradient_checkpointing = False
         self.post_init()
@@ -702,17 +793,15 @@ class MagGatedModel(MagGatedPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         # Handle cache
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -724,12 +813,27 @@ class MagGatedModel(MagGatedPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Create causal mask
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values
-        )
+        # Create causal mask using transformers masking_utils if available
+        # This properly handles packing/padding_free via FlashAttentionKwargs
+        if create_causal_mask is not None:
+            causal_mask = create_causal_mask(
+                config=self.config,
+                input_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+        else:
+            # Fallback for older transformers versions
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values
+            )
 
         hidden_states = inputs_embeds
+
+        # Compute position embeddings once (shared across all layers)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -745,25 +849,27 @@ class MagGatedModel(MagGatedPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    output_attentions,
                     use_cache,
                     cache_position,
+                    position_embeddings,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
                 )
 
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+            # GradientCheckpointingLayer returns tensor directly, not tuple
+            if isinstance(layer_outputs, torch.Tensor):
+                hidden_states = layer_outputs
+            else:
+                hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
 
@@ -771,8 +877,6 @@ class MagGatedModel(MagGatedPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = past_key_values if use_cache else None
-        if return_legacy_cache and next_cache is not None:
-            next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -785,7 +889,9 @@ class MagGatedModel(MagGatedPreTrainedModel):
         )
 
     def _update_causal_mask(self, attention_mask, input_tensor, cache_position, past_key_values):
-        """Create 4D causal mask from 2D attention_mask."""
+        """Create 4D causal mask from 2D attention_mask.
+        Fallback for older transformers versions without create_causal_mask.
+        """
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
@@ -861,6 +967,8 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Pass **kwargs through to model for FlashAttentionKwargs
+        # (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
