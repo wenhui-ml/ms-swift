@@ -1,4 +1,4 @@
-MODEL_DIR=${1:-/home/ubuntu/llm_weights/Qwen3-0.6B}
+MODEL_DIR=${1:-model_checkpoints/Qwen3-0.6B-standard}
 MAX_STEPS=${2:-10000}   
 nproc_per_node=${3:-8}
 
@@ -16,6 +16,8 @@ NPROC_PER_NODE=$nproc_per_node \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift pt \
     --model $MODEL_DIR \
+    --model_type qwen3 \
+    --template qwen3 \
     --tuner_type full \
     --dataset \
         /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_khan.jsonl \

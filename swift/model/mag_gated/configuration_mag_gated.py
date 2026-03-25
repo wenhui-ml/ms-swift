@@ -81,7 +81,12 @@ class MagGatedConfig(PretrainedConfig):
         gate_loss_weight=0.0,
         gate_target_sparsity=0.4,
         gate_grad_scale=1.0,
-        # === Standard options ===
+        # === Qwen3 / Standard options ===
+        max_window_layers=28,
+        sliding_window=None,
+        use_sliding_window=False,
+        rope_scaling=None,
+        torch_dtype=None,
         attention_bias=False,
         mlp_bias=False,
         attention_dropout=0.0,
@@ -118,11 +123,16 @@ class MagGatedConfig(PretrainedConfig):
         self.gate_loss_weight = gate_loss_weight
         self.gate_target_sparsity = gate_target_sparsity
         self.gate_grad_scale = gate_grad_scale
-        # Standard
+        # Qwen3 / Standard
+        self.max_window_layers = max_window_layers
+        self.sliding_window = sliding_window
+        self.use_sliding_window = use_sliding_window
+        self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.mlp_bias = mlp_bias
         self.attention_dropout = attention_dropout
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            torch_dtype=torch_dtype,
             **kwargs,
         )

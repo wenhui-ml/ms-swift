@@ -16,6 +16,9 @@ Usage:
 
     # Create MagGated with smaller d (the core experiment)
     python create_mag_gated_model.py --variant mag_gated_all --hidden_size 512
+
+    # Create using a preset
+    python create_mag_gated_model.py --preset qwen3-0.6b --variant baseline
 """
 
 import argparse
@@ -87,19 +90,48 @@ def create_model(args):
         intermediate_size = args.intermediate_size
 
     # Compute num_attention_heads and num_key_value_heads
-    if args.num_attention_heads is None:
+    num_attention_heads = args.num_attention_heads
+    head_dim = args.head_dim
+
+    if num_attention_heads is None:
         # Default: head_dim=128, adjust num_heads accordingly
-        head_dim = args.head_dim
         num_attention_heads = max(1, args.hidden_size // head_dim)
-    else:
-        num_attention_heads = args.num_attention_heads
-        head_dim = args.hidden_size // num_attention_heads
+    
+    # If head_dim is still None or we want to force d_model/n_heads (not the case for Qwen3)
+    if head_dim is None:
+         head_dim = args.hidden_size // num_attention_heads
 
     if args.num_key_value_heads is None:
         # GQA: use 1/4 of attention heads as KV heads, minimum 1
         num_key_value_heads = max(1, num_attention_heads // 4)
     else:
         num_key_value_heads = args.num_key_value_heads
+
+    # Apply preset if provided (overrides other args if not explicitly set)
+    if args.preset:
+        print(f"Applying preset: {args.preset}")
+        if args.preset == 'qwen2.5-0.5b':
+            # Actual Qwen2.5-0.5B: d=896, L=24, intermediate=4864, n_h=14, n_kv=2
+            args.hidden_size = 896
+            args.num_hidden_layers = 24
+            args.intermediate_size = 4864
+            args.num_attention_heads = 14
+            args.num_key_value_heads = 2
+            args.vocab_size = 151936
+        elif args.preset == 'qwen3-0.6b':
+            # User's Qwen3-0.6B target: d=1024, L=28, intermediate=3072, n_h=16, n_kv=8
+            args.hidden_size = 1024
+            args.num_hidden_layers = 28
+            args.intermediate_size = 3072
+            args.num_attention_heads = 16
+            args.num_key_value_heads = 8
+            args.vocab_size = 151669
+        
+        # Re-derive intermediate/heads just in case
+        intermediate_size = args.intermediate_size
+        num_attention_heads = args.num_attention_heads
+        num_key_value_heads = args.num_key_value_heads
+        head_dim = args.head_dim if args.head_dim else (args.hidden_size // num_attention_heads)
 
     # If tokenizer is provided, use its actual vocab size first
     actual_vocab_size = args.vocab_size
@@ -132,6 +164,12 @@ def create_model(args):
         mag_gate_positions=mag_gate_positions,
         use_residual_gate=use_residual_gate,
         residual_gate_rank=args.residual_gate_rank,
+        max_window_layers=args.max_window_layers,
+        use_sliding_window=args.use_sliding_window,
+        sliding_window=args.sliding_window,
+        torch_dtype=args.torch_dtype,
+        bos_token_id=args.bos_token_id,
+        eos_token_id=args.eos_token_id,
         attention_bias=False,
         mlp_bias=False,
         attention_dropout=0.0,
@@ -158,6 +196,14 @@ def create_model(args):
     # Create model
     print("\nInitializing model...")
     model = MagGatedForCausalLM(config)
+
+    # Convert to target dtype
+    if args.torch_dtype == "bfloat16":
+        print("Converting model to bfloat16...")
+        model = model.to(torch.bfloat16)
+    elif args.torch_dtype == "float16":
+        print("Converting model to float16...")
+        model = model.to(torch.float16)
 
     total_params, trainable_params = count_parameters(model)
     gate_params, mag_params, residual_gate_params = count_gate_parameters(model)
@@ -213,6 +259,15 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--tokenizer_from', type=str, default=None,
                         help='Path to copy tokenizer from (e.g., Qwen/Qwen2.5-0.5B)')
+    parser.add_argument('--preset', type=str, default=None,
+                        choices=['qwen2.5-0.5b', 'qwen3-0.6b'],
+                        help='Architecture preset (overrides most other dimensions)')
+    parser.add_argument('--max_window_layers', type=int, default=28)
+    parser.add_argument('--use_sliding_window', action='store_true', default=False)
+    parser.add_argument('--sliding_window', type=int, default=None)
+    parser.add_argument('--torch_dtype', type=str, default="bfloat16")
+    parser.add_argument('--bos_token_id', type=int, default=151643)
+    parser.add_argument('--eos_token_id', type=int, default=151645)
 
     args = parser.parse_args()
     create_model(args)
