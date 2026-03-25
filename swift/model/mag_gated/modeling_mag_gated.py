@@ -266,10 +266,12 @@ class ResidualGate(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        # Gate input: concat(residual, output) → 2d
-        # Raw values preserve full gradient flow (no abs/div that cause instability)
-        # The gate network learns magnitude/direction features internally
-        gate_input_size = hidden_size * 2
+        # Gate input: concat(residual, output, mag_ratio.detach(), dir_agree.detach()) → 4d
+        # - residual & output: provide gradient flow for backprop
+        # - mag_ratio & dir_agree: detached DoRA signals (no gradient, no instability)
+        #   These give the gate IMMEDIATE information about relative importance
+        #   without requiring the gate network to learn abs() and division.
+        gate_input_size = hidden_size * 4
 
         # Shared low-rank projection for both gates (parameter efficient)
         # Use _GateLinear so _init_weights() won't override our careful init
@@ -300,10 +302,20 @@ class ResidualGate(nn.Module):
         Returns:
             updated: (B, T, d) - dual-gated combination
         """
-        # Gate input: raw residual and output values
-        # The gate network learns to extract magnitude/direction features internally
-        # Raw values preserve clean gradient flow (no abs/div operations)
-        gate_input = torch.cat([residual, new_output], dim=-1)  # (B, T, 2d)
+        # DoRA-inspired magnitude/direction signals (DETACHED — no gradient through these)
+        # These give the gate immediate, pre-computed comparison signals
+        eps = 1e-6
+        h_mag = residual.detach().abs()
+        o_mag = new_output.detach().abs()
+        # Magnitude ratio: which source is stronger per dim ∈ [0, 1]
+        mag_ratio = h_mag / (h_mag + o_mag + eps)
+        # Direction agreement: per-element cosine ∈ [-1, 1]
+        dir_agree = (residual.detach() * new_output.detach()) / (h_mag * o_mag + eps)
+
+        # Gate input: [residual, output, mag_ratio, dir_agree]
+        # - residual & output: provide gradient flow for backprop
+        # - mag_ratio & dir_agree: detached hints (no gradient instability)
+        gate_input = torch.cat([residual, new_output, mag_ratio, dir_agree], dim=-1)  # (B, T, 4d)
 
         # Shared low-rank compression
         gate_hidden = self.gate_A(gate_input)  # (B, T, rank)

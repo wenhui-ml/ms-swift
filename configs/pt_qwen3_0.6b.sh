@@ -1,40 +1,54 @@
-#!/bin/bash
-# ============================================================================
-# Qwen3-0.6B 继续预训练 (对照基准)
-# 
-# Qwen3-0.6B specs:
-#   hidden_size=1024, L=28, n_h=16, n_kv=8, intermediate=3072
-#   ~600M params, vocab=151936, tie_embeddings=true
-#
-# Usage:
-#   bash configs/pt_qwen3_0.6b.sh
-# ============================================================================
+MODEL_DIR=${1:-/home/ubuntu/llm_weights/Qwen3-0.6B}
+MAX_STEPS=${2:-10000}   
+nproc_per_node=${3:-8}
 
-nproc_per_node=16
-export MASTER_PORT=$(shuf -i 20000-30000 -n 1)
+MODEL_NAME=$(basename $MODEL_DIR)
 
+echo "============================================"
+echo "MagGated Pretraining: $MODEL_NAME"
+echo "  Model: $MODEL_DIR"
+echo "  Max Steps: $MAX_STEPS"
+echo "  GPUs: $nproc_per_node"
+echo "============================================"
+
+# ★ 关键：NPROC_PER_NODE 必须设置，否则 swift 不会用 torchrun 启动多进程
 NPROC_PER_NODE=$nproc_per_node \
-CUDA_VISIBLE_DEVICES=7 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift pt \
-    --model /home/ubuntu/llm_weights/Qwen3-0.6B \
+    --model $MODEL_DIR \
     --tuner_type full \
-    --dataset swift/chinese-c4 \
+    --dataset \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_khan.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_math.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_stanford.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/fineweb_1000k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/magpie_10k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/skypile_600k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/starcoder_py.jsonl \
+    --streaming false \
     --torch_dtype bfloat16 \
-    --streaming true \
-    --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
-    --learning_rate 1e-5 \
-    --gradient_accumulation_steps $(expr 64 / $nproc_per_node) \
-    --packing true \
-    --eval_steps 500 \
-    --save_steps 500 \
-    --save_total_limit 2 \
+    --per_device_train_batch_size 2 \
+    --per_device_eval_batch_size 2 \
+    --learning_rate 1e-4 \
+    --gradient_accumulation_steps 16 \
+    --eval_steps 100 \
+    --save_steps 100 \
+    --save_total_limit 5 \
     --logging_steps 5 \
-    --max_length 8192 \
-    --max_steps 10000 \
+    --deepspeed zero1 \
+    --max_length 4096 \
+    --max_steps $MAX_STEPS \
     --warmup_ratio 0.05 \
-    --dataloader_num_workers 4 \
-    --dataset_num_proc 8 \
+    --weight_decay 0.1 \
+    --adam_beta1 0.9 \
+    --adam_beta2 0.95 \
+    --dataloader_num_workers 16 \
+    --dataset_num_proc 16 \
     --save_only_model true \
-    --output_dir output/Qwen3-0.6B \
-    --attn_impl flash_attn
+    --output_dir output/$MODEL_NAME \
+    --lr_scheduler_type cosine \
+    --use_hf true \
+    --dataset_shuffle true \
+    --train_dataloader_shuffle true \
+    --attn_impl flash_attention_3 \
+    --packing true
