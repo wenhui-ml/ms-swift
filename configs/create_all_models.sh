@@ -1,6 +1,6 @@
-# 1. 重新生成全量对标版 (d=1024)
+#!/bin/bash
+# 创建 ResidualGate 模型 (d=1024, Qwen3-0.6B 对标)
 python configs/create_mag_gated_model.py \
-    --variant mag_gated_all \
     --hidden_size 1024 \
     --intermediate_size 3072 \
     --num_hidden_layers 28 \

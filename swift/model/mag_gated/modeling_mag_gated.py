@@ -1,16 +1,17 @@
 # Copyright (c) 2024. All rights reserved.
-# Magnitude-Gated Transformer Model Implementation
+# ResidualGate Transformer Model Implementation
 """
-MagGated Transformer: Magnitude-Direction decomposition with dynamic gating.
+ResidualGate Transformer: Qwen3-compatible decoder-only model with dual-gated
+magnitude-aware residual connections.
 
-Key idea: Replace nn.Linear with MagGatedLinear:
-    y = m ⊙ g(x) ⊙ (V̂·x)
-where:
-    V̂ = direction matrix (row-normalized weights)
-    m = static magnitude (per output dim)
-    g(x) = sigmoid(B(A(x))) = dynamic input-dependent gate
+Core mechanism (replaces standard h = h + o):
+    h_new = α(h, o) ⊙ h + β(h, o) ⊙ o
 
-This allows selective dimension activation, enabling smaller hidden sizes.
+where α and β are independently computed per-dimension gates informed by
+DoRA-inspired magnitude/direction signals.
+
+All linear layers are standard nn.Linear — the ONLY architectural difference
+from Qwen3 is the ResidualGate at each residual connection.
 
 Supports:
 - Flash Attention 2/3 via transformers ALL_ATTENTION_FUNCTIONS dispatch
@@ -69,206 +70,10 @@ from .configuration_mag_gated import MagGatedConfig
 logger = logging.get_logger(__name__)
 
 
-# ==============================================================================
-# Gate Linear marker — skipped by _init_weights to preserve gate initialization
-# ==============================================================================
-
-class _GateLinear(nn.Linear):
-    """Marker subclass of nn.Linear for gate projections (gate_A, gate_B).
-
-    _init_weights() will skip this class, preserving the careful initialization
-    done in MagGatedLinear.__init__ and ResidualGate.__init__.
-    """
-    pass
 
 
 # ==============================================================================
-# Core: MagGatedLinear — replaces nn.Linear
-# ==============================================================================
-
-class MagGatedLinear(nn.Module):
-    """Magnitude-Gated Linear layer: y = m ⊙ g(x) ⊙ (V·x)
-
-    Decomposes a linear transformation into:
-    - V: Direction matrix (learned, standard linear weights)
-    - m: Static magnitude per output dimension
-    - g(x): Dynamic gate computed via low-rank projection
-
-    When g_j(x) → 0, the j-th output dimension is silenced.
-    This enables dimension-level routing / time-multiplexing.
-    """
-
-    def __init__(self, d_in: int, d_out: int, rank: int = 16,
-                 bias: bool = False, gate_init_bias: float = 0.0,
-                 gate_floor: float = 0.05,
-                 use_weight_norm: bool = False, use_gate_norm: bool = True,
-                 gate_mode: str = "softmax",
-                 gate_temperature: float = 1.0,
-                 gate_loss_type: str = "none",
-                 gate_target_sparsity: float = 0.4,
-                 gate_grad_scale: float = 1.0):
-        super().__init__()
-        self.d_out = d_out
-        self.use_weight_norm = use_weight_norm
-        self.use_gate_norm = use_gate_norm
-        self.gate_floor = gate_floor
-        self.gate_mode = gate_mode
-        self.gate_temperature = gate_temperature
-        self.gate_loss_type = gate_loss_type
-        self.gate_target_sparsity = gate_target_sparsity
-        self.gate_grad_scale = gate_grad_scale
-
-        # === Direction: standard linear (acts as V̂) ===
-        self.V = nn.Linear(d_in, d_out, bias=bias)
-
-        # === Magnitude: per-output-dim static scale ===
-        # For softmax mode: initial gate ≈ 1.0 (uniform softmax × d_out / d_out = 1.0)
-        # So m should be ≈ 1.0 to keep output scale ≈ standard Linear
-        if gate_mode == "softmax":
-            initial_m = 1.0
-        else:
-            # sigmoid mode: calibrate based on gate_init_bias
-            if use_weight_norm:
-                std = 0.02
-                initial_m = std * math.sqrt(d_in) / self._initial_effective_gate(gate_init_bias, gate_floor)
-            else:
-                initial_m = 1.0 / self._initial_effective_gate(gate_init_bias, gate_floor)
-        self.m = nn.Parameter(torch.full((d_out,), initial_m))
-
-        # === Dynamic Gate: low-rank projection ===
-        # g(x) = gate_fn(B(Norm(A(x))) + b)
-        # Use _GateLinear so _init_weights() won't override our careful init
-        self.gate_A = _GateLinear(d_in, rank, bias=False)
-        self.gate_norm = MagGatedRMSNorm(rank) if use_gate_norm else nn.Identity()
-        self.gate_B = _GateLinear(rank, d_out, bias=True)
-
-        if gate_mode == "softmax":
-            # For softmax mode: small random init for both weight and bias
-            # This gives near-uniform softmax initially (all logits ≈ 0)
-            # but with enough variation for gradient signal
-            nn.init.normal_(self.gate_B.weight, std=0.01)
-            nn.init.zeros_(self.gate_B.bias)  # Zero bias → uniform softmax
-            nn.init.normal_(self.gate_A.weight, std=0.1)
-        else:
-            # sigmoid mode: moderate bias for good gradient flow
-            nn.init.normal_(self.gate_B.weight, std=0.01)
-            nn.init.constant_(self.gate_B.bias, gate_init_bias)
-            nn.init.normal_(self.gate_A.weight, std=0.1)
-
-        # Gate monitoring: lightweight stats, no gradient, no extra memory
-        self._gate_stats: Optional[dict] = None
-        # Gate auxiliary loss (computed in forward, aggregated in model forward)
-        self._gate_aux_loss: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _initial_effective_gate(gate_init_bias: float, gate_floor: float) -> float:
-        """Compute effective gate value at initialization for m calibration."""
-        raw = torch.sigmoid(torch.tensor(gate_init_bias)).item()
-        return raw * (1.0 - gate_floor) + gate_floor
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_in)
-        Returns:
-            y: (batch, seq_len, d_out)
-        """
-        if self.use_weight_norm:
-            V_weight = F.normalize(self.V.weight, p=2, dim=1)
-            direction = F.linear(x, V_weight, self.V.bias)
-        else:
-            direction = self.V(x)                       # (B, T, d_out)
-
-        if self.gate_mode == "none":
-            # No gate — just magnitude-scaled linear: y = m ⊙ V(x)
-            # Gate parameters exist but are not used in forward pass.
-            # This is the recommended mode: MagGatedLinear gate is redundant with V.
-            # All gating is done by ResidualGate (which compares residual vs output).
-            return self.m * direction
-
-        gate_logits = self.gate_B(self.gate_norm(self.gate_A(x)))  # (B, T, d_out)
-
-        if self.gate_mode == "softmax":
-            gate = self.d_out * F.softmax(gate_logits / self.gate_temperature, dim=-1)
-        else:
-            # Sigmoid mode (legacy)
-            if self.training and self.gate_grad_scale != 1.0:
-                gate_logits = gate_logits * self.gate_grad_scale - gate_logits.detach() * (self.gate_grad_scale - 1.0)
-            gate_raw = torch.sigmoid(gate_logits)
-            gate = gate_raw * (1.0 - self.gate_floor) + self.gate_floor
-
-            if self.training and self.gate_loss_type != "none":
-                self._gate_aux_loss = self._compute_gate_aux_loss(gate_raw)
-
-        # Record gate statistics
-        if self.training:
-            with torch.no_grad():
-                gate_flat = gate.detach().float()
-                self._gate_stats = {
-                    "mean": gate_flat.mean().item(),
-                    "std": gate_flat.std().item(),
-                    "min": gate_flat.min().item(),
-                    "max": gate_flat.max().item(),
-                    "sparsity": (gate_flat < (0.5 if self.gate_mode == "softmax" else 0.1)).float().mean().item(),
-                    "saturation": (gate_flat > (1.5 if self.gate_mode == "softmax" else 0.9)).float().mean().item(),
-                    "dim_mean": gate_flat.mean(dim=(0, 1)).cpu(),
-                }
-
-        return self.m * gate * direction
-
-    def _compute_gate_aux_loss(self, gate_raw: torch.Tensor) -> torch.Tensor:
-        """Compute auxiliary loss for sigmoid mode (not needed for softmax)."""
-        if self.gate_loss_type == "l1_target":
-            dim_mean = gate_raw.mean(dim=(0, 1))
-            return (dim_mean.mean() - self.gate_target_sparsity) ** 2
-        elif self.gate_loss_type == "neg_entropy":
-            eps = 1e-6
-            entropy = -(gate_raw * torch.log(gate_raw + eps) +
-                       (1 - gate_raw) * torch.log(1 - gate_raw + eps))
-            return entropy.mean()
-        elif self.gate_loss_type == "l1_sparse":
-            return gate_raw.mean()
-        else:
-            return torch.tensor(0.0, device=gate_raw.device)
-
-    @property
-    def weight(self):
-        """For compatibility with code that accesses .weight"""
-        return self.V.weight
-
-    @property
-    def in_features(self):
-        return self.V.in_features
-
-    @property
-    def out_features(self):
-        return self.V.out_features
-
-
-def _make_linear(d_in: int, d_out: int, config: MagGatedConfig,
-                 use_gate: bool, bias: bool = False) -> nn.Module:
-    """Factory: create MagGatedLinear or standard nn.Linear based on config."""
-    if config.use_mag_gate and use_gate:
-        return MagGatedLinear(
-            d_in, d_out,
-            rank=config.gate_rank,
-            bias=bias,
-            gate_init_bias=config.gate_init_bias,
-            gate_floor=getattr(config, "gate_floor", 0.05),
-            use_weight_norm=getattr(config, "use_weight_norm", False),
-            use_gate_norm=getattr(config, "use_gate_norm", True),
-            gate_mode=getattr(config, "gate_mode", "softmax"),
-            gate_temperature=getattr(config, "gate_temperature", 1.0),
-            gate_loss_type=getattr(config, "gate_loss_type", "none"),
-            gate_target_sparsity=getattr(config, "gate_target_sparsity", 0.4),
-            gate_grad_scale=getattr(config, "gate_grad_scale", 1.0),
-        )
-    else:
-        return nn.Linear(d_in, d_out, bias=bias)
-
-
-# ==============================================================================
-# Residual Forgetting Gate
+# ResidualGate — the ONLY architectural innovation
 # ==============================================================================
 
 class ResidualGate(nn.Module):
@@ -280,92 +85,73 @@ class ResidualGate(nn.Module):
         α ∈ (0,1)^d = retain gate (how much old info to keep per dimension)
         β ∈ (0,1)^d = accept gate (how much new info to accept per dimension)
 
-    Key design principles:
-    1. Dual gates: α and β are INDEPENDENT — model can keep old AND accept new,
-       or discard old AND reject new, per dimension.
-    2. Gate sees BOTH residual and output (can compare importance).
-    3. DoRA-inspired magnitude awareness: gate input includes per-dimension
-       magnitude ratio |h|/(|h|+|o|), giving the gate an immediate signal
-       about relative information strength.
-    4. init_bias=3.0 for both → sigmoid(3)≈0.95 → initial behavior ≈ standard
-       residual h + o. Gate learns to deviate from this as needed.
+    Gate input is concat([h, o, mag_ratio, dir_agree]) → 4d, compressed through
+    a shared low-rank bottleneck (Gate_A: 4d→rank) then split into two independent
+    projections (Gate_B_alpha: rank→d, Gate_B_beta: rank→d).
 
-    Possible behaviors per dimension:
-        α≈1, β≈1: standard residual (both important)
-        α≈1, β≈0: retain old, reject new (dimension already has good info)
-        α≈0, β≈1: forget old, accept new (release dimension for new knowledge)
-        α≈0, β≈0: suppress dimension entirely (dimension is noise)
+    DoRA-inspired signals (detached, no gradient):
+        mag_ratio = |h| / (|h| + |o| + ε)   — relative strength per dimension
+        dir_agree = (h·o) / (|h|·|o| + ε)   — directional agreement per dimension
+
+    init_bias=5.0 → sigmoid(5)≈0.993 → initial h_new ≈ 0.993h + 0.993o ≈ h + o
     """
 
-    def __init__(self, hidden_size: int, rank: int = 16, init_bias: float = 3.0):
+    def __init__(self, hidden_size: int, rank: int = 16, init_bias: float = 5.0):
         super().__init__()
         self.hidden_size = hidden_size
 
-        # Gate input: concat(residual, output, mag_ratio.detach(), dir_agree.detach()) → 4d
-        # - residual & output: provide gradient flow for backprop
-        # - mag_ratio & dir_agree: detached DoRA signals (no gradient, no instability)
-        #   These give the gate IMMEDIATE information about relative importance
-        #   without requiring the gate network to learn abs() and division.
+        # Gate input: concat(h, o, mag_ratio, dir_agree) → 4d
         gate_input_size = hidden_size * 4
 
-        # Shared low-rank projection for both gates (parameter efficient)
-        # Use _GateLinear so _init_weights() won't override our careful init
-        self.gate_A = _GateLinear(gate_input_size, rank, bias=False)
-        # Two separate output projections: one for α, one for β
-        self.gate_B_alpha = _GateLinear(rank, hidden_size, bias=True)
-        self.gate_B_beta = _GateLinear(rank, hidden_size, bias=True)
+        # Shared low-rank projection (parameter efficient)
+        self.gate_A = nn.Linear(gate_input_size, rank, bias=False)
+        # Two independent output projections for α and β
+        self.gate_B_alpha = nn.Linear(rank, hidden_size, bias=True)
+        self.gate_B_beta = nn.Linear(rank, hidden_size, bias=True)
 
-        # init_bias=3.0 → sigmoid(3)≈0.953
-        # Initial: α≈0.95, β≈0.95 → h_new ≈ 0.95*h + 0.95*o ≈ h + o
-        # This makes initial behavior very close to standard residual connection,
-        # so the model starts learning normally. Gates then gradually learn to
-        # deviate: lowering α for redundant dims, lowering β for noisy dims.
+        # Careful initialization:
+        # - gate_B weights ≈ 0 (small random noise for symmetry breaking)
+        # - gate_B bias = init_bias → sigmoid(5.0) ≈ 0.993 (near-identity start)
+        # - gate_A weights: moderate std for gradient flow
         nn.init.normal_(self.gate_B_alpha.weight, std=0.01)
         nn.init.constant_(self.gate_B_alpha.bias, init_bias)
         nn.init.normal_(self.gate_B_beta.weight, std=0.01)
         nn.init.constant_(self.gate_B_beta.bias, init_bias)
         nn.init.normal_(self.gate_A.weight, std=0.02)
 
-        # Gate monitoring
+        # Gate monitoring (lightweight, no gradient)
         self._gate_stats: Optional[dict] = None
 
     def forward(self, residual: torch.Tensor, new_output: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            residual: (B, T, d) - the residual stream
-            new_output: (B, T, d) - output from attention/FFN sub-layer
+            residual: (B, T, d) - the residual stream (h)
+            new_output: (B, T, d) - output from attention/FFN sub-layer (o)
         Returns:
-            updated: (B, T, d) - dual-gated combination
+            updated: (B, T, d) - dual-gated combination α⊙h + β⊙o
         """
-        # DoRA-inspired magnitude/direction signals (DETACHED — no gradient through these)
-        # These give the gate immediate, pre-computed comparison signals
+        # DoRA-inspired signals (DETACHED — read-only physics sensors, no gradient)
         eps = 1e-6
         h_mag = residual.detach().abs()
         o_mag = new_output.detach().abs()
-        # Magnitude ratio: which source is stronger per dim ∈ [0, 1]
-        mag_ratio = h_mag / (h_mag + o_mag + eps)
-        # Direction agreement: per-element cosine ∈ [-1, 1]
-        dir_agree = (residual.detach() * new_output.detach()) / (h_mag * o_mag + eps)
+        mag_ratio = h_mag / (h_mag + o_mag + eps)                              # ∈ [0, 1]
+        dir_agree = (residual.detach() * new_output.detach()) / (h_mag * o_mag + eps)  # ∈ [-1, 1]
 
-        # Gate input: [residual, output, mag_ratio, dir_agree]
-        # - residual & output: provide gradient flow for backprop
-        # - mag_ratio & dir_agree: detached hints (no gradient instability)
+        # Gate input: h and o carry gradient; mag/dir are detached hints
         gate_input = torch.cat([residual, new_output, mag_ratio, dir_agree], dim=-1)  # (B, T, 4d)
 
-        # Shared low-rank compression
-        gate_hidden = self.gate_A(gate_input)  # (B, T, rank)
+        # Shared low-rank compression → independent α and β
+        gate_hidden = self.gate_A(gate_input)                                  # (B, T, rank)
+        alpha = torch.sigmoid(self.gate_B_alpha(gate_hidden))                  # (B, T, d)
+        beta = torch.sigmoid(self.gate_B_beta(gate_hidden))                    # (B, T, d)
 
-        # Independent α and β
-        alpha = torch.sigmoid(self.gate_B_alpha(gate_hidden))  # (B, T, d) retain gate
-        beta = torch.sigmoid(self.gate_B_beta(gate_hidden))    # (B, T, d) accept gate
-
-        # Record gate statistics
+        # Record gate statistics for monitoring
         if self.training:
             with torch.no_grad():
                 a = alpha.detach().float()
                 b = beta.detach().float()
                 self._gate_stats = {
-                    "mean": a.mean().item(),       # α mean (retain)
+                    "mean": a.mean().item(),
                     "std": a.std().item(),
                     "min": a.min().item(),
                     "max": a.max().item(),
@@ -373,14 +159,14 @@ class ResidualGate(nn.Module):
                     "saturation": (a > 0.9).float().mean().item(),
                     "forget_ratio": (a < 0.5).float().mean().item(),
                     "dim_mean": a.mean(dim=(0, 1)).cpu(),
-                    # β stats (accept gate)
                     "beta_mean": b.mean().item(),
                     "beta_std": b.std().item(),
+                    "beta_min": b.min().item(),
+                    "beta_max": b.max().item(),
                     "beta_sparsity": (b < 0.1).float().mean().item(),
                     "beta_saturation": (b > 0.9).float().mean().item(),
                 }
 
-        # Dual-gate combination: α ⊙ residual + β ⊙ output
         return alpha * residual + beta * new_output
 
 
@@ -417,7 +203,6 @@ class MagGatedRotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
@@ -428,7 +213,6 @@ class MagGatedRotaryEmbedding(nn.Module):
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
@@ -443,8 +227,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads for GQA. (batch, num_kv_heads, seqlen, head_dim) ->
-    (batch, num_attention_heads, seqlen, head_dim)"""
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -453,7 +235,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 # ==============================================================================
-# Eager attention fallback (used when _attn_implementation == "eager")
+# Eager attention fallback
 # ==============================================================================
 
 def eager_attention_forward(
@@ -466,7 +248,6 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
-    """Eager attention implementation compatible with ALL_ATTENTION_FUNCTIONS dispatch."""
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
@@ -484,27 +265,14 @@ def eager_attention_forward(
 
 
 # ==============================================================================
-# Attention
+# Attention (standard nn.Linear, identical to Qwen3)
 # ==============================================================================
 
-def _should_gate(name: str, positions: str) -> bool:
-    """Decide whether a given projection should use MagGated."""
-    if positions == "none":
-        return False
-    if positions == "all":
-        return True
-    if positions == "bottleneck":
-        # Only gate the write-back projections: o_proj and down_proj
-        return name in ("o_proj", "down_proj")
-    return False
-
-
 class MagGatedAttention(nn.Module):
-    """Multi-head attention with optional MagGated projections.
+    """Multi-head attention with standard nn.Linear projections.
 
-    Supports flash_attention_2, flash_attention_3, sdpa, eager, flex_attention
-    via transformers ALL_ATTENTION_FUNCTIONS dispatch mechanism.
-    This enables packing/padding_free training with cu_seq_lens.
+    Supports flash_attention_2/3, sdpa, eager, flex_attention
+    via transformers ALL_ATTENTION_FUNCTIONS dispatch.
     """
 
     def __init__(self, config: MagGatedConfig, layer_idx: int):
@@ -520,20 +288,10 @@ class MagGatedAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        pos = config.mag_gate_positions
-
-        self.q_proj = _make_linear(
-            self.hidden_size, self.num_heads * self.head_dim, config,
-            use_gate=_should_gate("q_proj", pos), bias=config.attention_bias)
-        self.k_proj = _make_linear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, config,
-            use_gate=_should_gate("k_proj", pos), bias=config.attention_bias)
-        self.v_proj = _make_linear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, config,
-            use_gate=_should_gate("v_proj", pos), bias=config.attention_bias)
-        self.o_proj = _make_linear(
-            self.num_heads * self.head_dim, self.hidden_size, config,
-            use_gate=_should_gate("o_proj", pos), bias=config.attention_bias)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         self.rotary_emb = MagGatedRotaryEmbedding(
             self.head_dim,
@@ -564,9 +322,6 @@ class MagGatedAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # Use ALL_ATTENTION_FUNCTIONS dispatch if available (transformers >= 4.46)
-        # This enables flash_attention_2, flash_attention_3, sdpa, flex_attention, etc.
-        # and supports packing/padding_free via cu_seq_lens_q/k kwargs.
         attention_interface: Callable = eager_attention_forward
         if ALL_ATTENTION_FUNCTIONS is not None and self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -589,36 +344,20 @@ class MagGatedAttention(nn.Module):
 
 
 # ==============================================================================
-# MLP (SwiGLU)
+# MLP — SwiGLU (standard nn.Linear, identical to Qwen3)
 # ==============================================================================
 
 class MagGatedMLP(nn.Module):
-    """SwiGLU MLP with optional MagGated projections.
-
-    Note: The gate_proj in SwiGLU already provides gating, so we don't
-    add MagGated to it (would be redundant). Only up_proj and down_proj
-    get MagGated treatment when configured.
-    """
+    """SwiGLU MLP with standard nn.Linear projections."""
 
     def __init__(self, config: MagGatedConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        pos = config.mag_gate_positions
-
-        # gate_proj: SwiGLU's own gate — no MagGated (already gated)
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-
-        # up_proj: can be MagGated
-        self.up_proj = _make_linear(
-            self.hidden_size, self.intermediate_size, config,
-            use_gate=_should_gate("up_proj", pos), bias=config.mlp_bias)
-
-        # down_proj: ★ key bottleneck — writes back to residual
-        self.down_proj = _make_linear(
-            self.intermediate_size, self.hidden_size, config,
-            use_gate=_should_gate("down_proj", pos), bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
 
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -631,14 +370,11 @@ class MagGatedMLP(nn.Module):
 # ==============================================================================
 
 class MagGatedDecoderLayer(GradientCheckpointingLayer):
-    """Transformer decoder layer with MagGated Linear and residual gating.
-
-    Inherits from GradientCheckpointingLayer for automatic gradient checkpointing
-    support in transformers >= 4.46.
+    """Transformer decoder layer with ResidualGate.
 
     Structure:
-        h → norm1 → MagGated_Attn → [residual_gate] → h + attn_out
-        h → norm2 → MagGated_MLP  → [residual_gate] → h + ffn_out
+        h → norm1 → Attn → ResidualGate(h, attn_out) → h'
+        h'→ norm2 → MLP  → ResidualGate(h', ffn_out) → h''
     """
 
     def __init__(self, config: MagGatedConfig, layer_idx: int):
@@ -649,14 +385,13 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = MagGatedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MagGatedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Residual forgetting gates
+        # ResidualGate (the ONLY difference from Qwen3)
         self.use_residual_gate = config.use_residual_gate
         if self.use_residual_gate:
-            residual_bias = getattr(config, 'residual_gate_init_bias', 4.0)
-            self.attn_residual_gate = ResidualGate(
-                config.hidden_size, rank=config.residual_gate_rank, init_bias=residual_bias)
-            self.ffn_residual_gate = ResidualGate(
-                config.hidden_size, rank=config.residual_gate_rank, init_bias=residual_bias)
+            init_bias = config.residual_gate_init_bias
+            rank = config.residual_gate_rank
+            self.attn_residual_gate = ResidualGate(config.hidden_size, rank=rank, init_bias=init_bias)
+            self.ffn_residual_gate = ResidualGate(config.hidden_size, rank=rank, init_bias=init_bias)
 
     def forward(
         self,
@@ -673,8 +408,6 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self attention — pass **kwargs through for FlashAttentionKwargs
-        # (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
         attn_output, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -684,7 +417,7 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
 
-        # Residual with forgetting gate
+        # Residual connection: gated or standard
         if self.use_residual_gate:
             hidden_states = self.attn_residual_gate(residual, attn_output)
         else:
@@ -695,7 +428,6 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         ffn_output = self.mlp(hidden_states)
 
-        # Residual with forgetting gate
         if self.use_residual_gate:
             hidden_states = self.ffn_residual_gate(residual, ffn_output)
         else:
@@ -715,7 +447,6 @@ class MagGatedPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["MagGatedDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
 
-    # === Enable flash attention and attention backend dispatch ===
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -724,17 +455,11 @@ class MagGatedPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, _GateLinear):
-            # Skip! Gate projections have careful init in MagGatedLinear/ResidualGate.__init__
-            # (gate_B.weight=0, gate_B.bias=init_bias, gate_A.weight~N(0,0.01))
-            pass
-        elif isinstance(module, MagGatedLinear):
-            nn.init.normal_(module.V.weight, mean=0.0, std=std)
-            if module.V.bias is not None:
-                nn.init.zeros_(module.V.bias)
-            # P1-3: m is calibrated in MagGatedLinear.__init__ to compensate gate
-            # Don't override here — the __init__ already computed the correct value
-        elif isinstance(module, nn.Linear):
+        # Skip init for internal linear layers of ResidualGate as they are carefully initialized
+        if hasattr(module, "_is_residual_gate_linear"):
+            return
+            
+        if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -745,7 +470,7 @@ class MagGatedPreTrainedModel(PreTrainedModel):
 
 
 class MagGatedModel(MagGatedPreTrainedModel):
-    """MagGated Transformer model (decoder-only, no LM head)."""
+    """ResidualGate Transformer model (decoder-only, no LM head)."""
 
     def __init__(self, config: MagGatedConfig):
         super().__init__(config)
@@ -764,6 +489,15 @@ class MagGatedModel(MagGatedPreTrainedModel):
         )
 
         self.gradient_checkpointing = False
+
+        # Mark all ResidualGate linears BEFORE post_init() so they are
+        # skipped by _init_weights (which is called inside post_init).
+        for name, module in self.named_modules():
+            if isinstance(module, ResidualGate):
+                module.gate_A._is_residual_gate_linear = True
+                module.gate_B_alpha._is_residual_gate_linear = True
+                module.gate_B_beta._is_residual_gate_linear = True
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -799,7 +533,6 @@ class MagGatedModel(MagGatedPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Handle cache
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
@@ -813,8 +546,6 @@ class MagGatedModel(MagGatedPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Create causal mask using transformers masking_utils if available
-        # This properly handles packing/padding_free via FlashAttentionKwargs
         if create_causal_mask is not None:
             causal_mask = create_causal_mask(
                 config=self.config,
@@ -825,14 +556,11 @@ class MagGatedModel(MagGatedPreTrainedModel):
                 position_ids=position_ids,
             )
         else:
-            # Fallback for older transformers versions
             causal_mask = self._update_causal_mask(
                 attention_mask, inputs_embeds, cache_position, past_key_values
             )
 
         hidden_states = inputs_embeds
-
-        # Compute position embeddings once (shared across all layers)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
@@ -865,7 +593,6 @@ class MagGatedModel(MagGatedPreTrainedModel):
                     **kwargs,
                 )
 
-            # GradientCheckpointingLayer returns tensor directly, not tuple
             if isinstance(layer_outputs, torch.Tensor):
                 hidden_states = layer_outputs
             else:
@@ -889,9 +616,7 @@ class MagGatedModel(MagGatedPreTrainedModel):
         )
 
     def _update_causal_mask(self, attention_mask, input_tensor, cache_position, past_key_values):
-        """Create 4D causal mask from 2D attention_mask.
-        Fallback for older transformers versions without create_causal_mask.
-        """
+        """Fallback causal mask for older transformers versions."""
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
@@ -901,7 +626,6 @@ class MagGatedModel(MagGatedPreTrainedModel):
             else sequence_length
         )
 
-        # Create causal mask
         causal_mask = torch.full(
             (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
         )
@@ -924,7 +648,7 @@ class MagGatedModel(MagGatedPreTrainedModel):
 
 
 class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
-    """MagGated Transformer with causal language model head."""
+    """ResidualGate Transformer with causal language model head."""
 
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -967,8 +691,6 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Pass **kwargs through to model for FlashAttentionKwargs
-        # (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -989,7 +711,6 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
@@ -997,18 +718,6 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-
-            # === Gate auxiliary loss: direct gradient signal for gate differentiation ===
-            gate_loss_weight = getattr(self.config, 'gate_loss_weight', 0.1)
-            gate_loss_type = getattr(self.config, 'gate_loss_type', 'l1_target')
-            if gate_loss_weight > 0 and gate_loss_type != 'none':
-                gate_aux_losses = []
-                for module in self.modules():
-                    if isinstance(module, MagGatedLinear) and module._gate_aux_loss is not None:
-                        gate_aux_losses.append(module._gate_aux_loss)
-                if gate_aux_losses:
-                    total_gate_loss = torch.stack(gate_aux_losses).mean()
-                    loss = loss + gate_loss_weight * total_gate_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1031,7 +740,6 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
         cache_position=None,
         **kwargs,
     ):
-        # If we have cache, only take the last token
         if past_key_values is not None:
             if input_ids.shape[1] != 1:
                 input_ids = input_ids[:, -1:]
@@ -1059,406 +767,107 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
     # ==================================================================
 
     def get_gate_stats(self) -> dict:
-        """Collect gate statistics from all MagGatedLinear and ResidualGate modules.
-
-        Returns a dict suitable for logging to TensorBoard/WandB, e.g.:
-        {
-            "gate/layer0_q_proj_mean": 0.85,
-            "gate/layer0_q_proj_sparsity": 0.02,
-            "gate/layer0_attn_residual_mean": 0.97,
-            ...
-            "gate/global_mean": 0.82,        # average across ALL mag gates
-            "gate/global_sparsity": 0.05,    # fraction of mag gates < 0.1
-            "gate/global_saturation": 0.70,  # fraction of mag gates > 0.9
-            "gate/global_std": 0.15,         # average std across all mag gates
-            "gate/residual_global_mean": 0.95,  # average across all residual gates
-            "gate/residual_global_sparsity": 0.0,
-            "gate/residual_global_saturation": 0.8,
-            "gate/dim_active_ratio": 0.45,   # fraction of dims with mean gate > 0.5
-            "gate/dim_reuse_score": 0.72,    # cross-layer dimension reuse metric
-            "gate/health": "ok",             # "ok" / "warning_all_on" / "warning_all_off" / "warning_no_differentiation"
-        }
-        """
-        import torch as _torch
-
+        """Collect ResidualGate statistics from all layers."""
         stats = {}
-
-        # === MagGatedLinear gate stats ===
-        mag_means = []
-        mag_sparsities = []
-        mag_saturations = []
-        mag_stds = []
-        mag_dim_means = []  # list of (d_out,) tensors for dimension reuse analysis
-
-        # === Magnitude (m) stats ===
-        m_means = []
-        m_stds = []
-        m_mins = []
-        m_maxs = []
-
-        # === ResidualGate stats (separate tracking) ===
-        res_means = []
+        res_alpha_means = []
+        res_beta_means = []
         res_sparsities = []
         res_saturations = []
         res_forget_ratios = []
 
-        # Per-layer summary for detailed logging
-        layer_summaries = []
-
-        def _collect_mag_linear_stats(proj, prefix, layer_mag_means, layer_mag_stds):
-            """Helper to collect stats from a MagGatedLinear projection."""
-            for k, v in proj._gate_stats.items():
-                if k != "dim_mean":  # dim_mean is a tensor, log separately
-                    stats[f"{prefix}_{k}"] = v
-            mag_means.append(proj._gate_stats["mean"])
-            mag_sparsities.append(proj._gate_stats["sparsity"])
-            mag_saturations.append(proj._gate_stats["saturation"])
-            mag_stds.append(proj._gate_stats["std"])
-            layer_mag_means.append(proj._gate_stats["mean"])
-            layer_mag_stds.append(proj._gate_stats["std"])
-            if "dim_mean" in proj._gate_stats:
-                mag_dim_means.append(proj._gate_stats["dim_mean"])
-
-            # Collect magnitude (m) statistics
-            m_data = proj.m.data.detach().float()
-            m_mean = m_data.mean().item()
-            m_std = m_data.std().item()
-            m_min = m_data.min().item()
-            m_max = m_data.max().item()
-            stats[f"{prefix}_m_mean"] = m_mean
-            stats[f"{prefix}_m_std"] = m_std
-            stats[f"{prefix}_m_min"] = m_min
-            stats[f"{prefix}_m_max"] = m_max
-            m_means.append(m_mean)
-            m_stds.append(m_std)
-            m_mins.append(m_min)
-            m_maxs.append(m_max)
-
         for layer_idx, layer in enumerate(self.model.layers):
-            layer_mag_means = []
-            layer_mag_stds = []
+            if not layer.use_residual_gate:
+                continue
 
-            # MagGated projections in attention
-            for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-                proj = getattr(layer.self_attn, proj_name, None)
-                if isinstance(proj, MagGatedLinear) and proj._gate_stats is not None:
-                    prefix = f"gate/layer{layer_idx}_{proj_name}"
-                    _collect_mag_linear_stats(proj, prefix, layer_mag_means, layer_mag_stds)
+            for gate_name in ["attn_residual_gate", "ffn_residual_gate"]:
+                gate = getattr(layer, gate_name, None)
+                if isinstance(gate, ResidualGate) and gate._gate_stats is not None:
+                    gs = gate._gate_stats
+                    prefix = f"gate/layer{layer_idx}_{gate_name}"
 
-            # MagGated projections in MLP
-            for proj_name in ["up_proj", "down_proj"]:
-                proj = getattr(layer.mlp, proj_name, None)
-                if isinstance(proj, MagGatedLinear) and proj._gate_stats is not None:
-                    prefix = f"gate/layer{layer_idx}_{proj_name}"
-                    _collect_mag_linear_stats(proj, prefix, layer_mag_means, layer_mag_stds)
+                    # α (retain gate) stats
+                    for k in ["mean", "std", "min", "max", "sparsity", "saturation"]:
+                        if k in gs:
+                            stats[f"{prefix}_{k}"] = gs[k]
 
-            # Residual gates — dual-gate (α retain + β accept)
-            if layer.use_residual_gate:
-                for gate_name in ["attn_residual_gate", "ffn_residual_gate"]:
-                    gate = getattr(layer, gate_name, None)
-                    if isinstance(gate, ResidualGate) and gate._gate_stats is not None:
-                        gs = gate._gate_stats
-                        # α (retain gate) stats
-                        prefix_alpha = f"gate/layer{layer_idx}_{gate_name}"
-                        for k in ["mean", "std", "min", "max", "sparsity", "saturation"]:
-                            if k in gs:
-                                stats[f"{prefix_alpha}_{k}"] = gs[k]
-                        # β (accept gate) stats — stored with _beta suffix
-                        prefix_beta = f"gate/layer{layer_idx}_{gate_name}_beta"
-                        for k in ["beta_mean", "beta_std", "beta_sparsity", "beta_saturation"]:
-                            if k in gs:
-                                short_k = k.replace("beta_", "")
-                                stats[f"{prefix_beta}_{short_k}"] = gs[k]
+                    # β (accept gate) stats
+                    prefix_beta = f"gate/layer{layer_idx}_{gate_name}_beta"
+                    for k in ["beta_mean", "beta_std", "beta_min", "beta_max", "beta_sparsity", "beta_saturation"]:
+                        if k in gs:
+                            short_k = k.replace("beta_", "")
+                            stats[f"{prefix_beta}_{short_k}"] = gs[k]
 
-                        # Collect for global summary
-                        res_means.append(gs["mean"])
-                        if "sparsity" in gs:
-                            res_sparsities.append(gs["sparsity"])
-                        if "saturation" in gs:
-                            res_saturations.append(gs["saturation"])
-                        if "forget_ratio" in gs:
-                            res_forget_ratios.append(gs["forget_ratio"])
+                    # Collect for global summary
+                    res_alpha_means.append(gs["mean"])
+                    if "beta_mean" in gs:
+                        res_beta_means.append(gs["beta_mean"])
+                    if "sparsity" in gs:
+                        res_sparsities.append(gs["sparsity"])
+                    if "saturation" in gs:
+                        res_saturations.append(gs["saturation"])
+                    if "forget_ratio" in gs:
+                        res_forget_ratios.append(gs["forget_ratio"])
 
-                        # β global stats
-                        if "beta_mean" in gs:
-                            if "res_beta_means" not in locals():
-                                res_beta_means = []
-                            res_beta_means.append(gs["beta_mean"])
-
-            # Per-layer summary
-            if layer_mag_means:
-                layer_mean = sum(layer_mag_means) / len(layer_mag_means)
-                layer_std = sum(layer_mag_stds) / len(layer_mag_stds)
-                stats[f"gate/layer{layer_idx}_summary_mean"] = layer_mean
-                stats[f"gate/layer{layer_idx}_summary_std"] = layer_std
-                layer_summaries.append((layer_idx, layer_mean, layer_std))
-
-        # === Global MagGatedLinear summary ===
-        if mag_means:
-            global_mean = sum(mag_means) / len(mag_means)
-            stats["gate/global_mean"] = global_mean
-        if mag_sparsities:
-            global_sparsity = sum(mag_sparsities) / len(mag_sparsities)
-            stats["gate/global_sparsity"] = global_sparsity
-        if mag_saturations:
-            global_saturation = sum(mag_saturations) / len(mag_saturations)
-            stats["gate/global_saturation"] = global_saturation
-        if mag_stds:
-            global_std = sum(mag_stds) / len(mag_stds)
-            stats["gate/global_std"] = global_std
-
-        # === Global Magnitude (m) summary ===
-        if m_means:
-            stats["mag/global_m_mean"] = sum(m_means) / len(m_means)
-            stats["mag/global_m_std"] = sum(m_stds) / len(m_stds)
-            stats["mag/global_m_min"] = min(m_mins)
-            stats["mag/global_m_max"] = max(m_maxs)
-            # m differentiation: if m_std across dims is high, model learned dim importance
-            stats["mag/m_differentiation"] = sum(m_stds) / len(m_stds)
-
-        # === Global ResidualGate summary (separate from MagGatedLinear) ===
-        if res_means:
-            stats["gate/residual_alpha_global_mean"] = sum(res_means) / len(res_means)
-            # Keep old key for backward compatibility
-            stats["gate/residual_global_mean"] = stats["gate/residual_alpha_global_mean"]
+        # Global summary
+        if res_alpha_means:
+            stats["gate/residual_alpha_global_mean"] = sum(res_alpha_means) / len(res_alpha_means)
+        if res_beta_means:
+            stats["gate/residual_beta_global_mean"] = sum(res_beta_means) / len(res_beta_means)
         if res_sparsities:
             stats["gate/residual_global_sparsity"] = sum(res_sparsities) / len(res_sparsities)
         if res_saturations:
             stats["gate/residual_global_saturation"] = sum(res_saturations) / len(res_saturations)
         if res_forget_ratios:
             stats["gate/residual_global_forget_ratio"] = sum(res_forget_ratios) / len(res_forget_ratios)
-        # β (accept gate) global summary
-        if "res_beta_means" in locals() and res_beta_means:
-            stats["gate/residual_beta_global_mean"] = sum(res_beta_means) / len(res_beta_means)
-
-        # === Dimension reuse analysis ===
-        # Analyze how dimensions are used across layers (key metric for the paper thesis)
-        if mag_dim_means:
-            try:
-                # Stack all dim_mean tensors: shape (num_gates, d_out_varies)
-                # Group by output dimension size for meaningful analysis
-                dim_groups = {}
-                for dm in mag_dim_means:
-                    d = dm.shape[0]
-                    if d not in dim_groups:
-                        dim_groups[d] = []
-                    dim_groups[d].append(dm)
-
-                total_active = 0
-                total_dims = 0
-                all_dim_stds = []
-
-                for d, tensors in dim_groups.items():
-                    stacked = _torch.stack(tensors)  # (num_gates_with_this_d, d)
-                    # Active ratio: fraction of dims with mean gate > 0.5
-                    dim_avg = stacked.mean(dim=0)  # (d,) average across all gates
-                    active = (dim_avg > 0.5).float().sum().item()
-                    total_active += active
-                    total_dims += d
-
-                    # Dimension reuse: std across gates for each dim
-                    # High std = dimension used differently by different layers = good reuse
-                    if stacked.shape[0] > 1:
-                        dim_std = stacked.std(dim=0)  # (d,) std across gates
-                        all_dim_stds.append(dim_std.mean().item())
-
-                if total_dims > 0:
-                    stats["gate/dim_active_ratio"] = total_active / total_dims
-
-                if all_dim_stds:
-                    # Reuse score: higher std across layers = more differentiated usage
-                    stats["gate/dim_reuse_score"] = sum(all_dim_stds) / len(all_dim_stds)
-            except Exception:
-                pass  # Dimension analysis is best-effort
-
-        # === Health check: detect degenerate gates ===
-        if mag_means:
-            if global_saturation > 0.95:
-                stats["gate/health"] = "warning_all_on"  # Gates nearly all 1 → no gating effect
-            elif global_sparsity > 0.95:
-                stats["gate/health"] = "warning_all_off"  # Gates nearly all 0 → model dead
-            elif global_sparsity < 0.01 and global_saturation < 0.01:
-                # NEW: Detect undifferentiated gates — all gates clustered around mean
-                # This means the gate mechanism is not learning to differentiate dimensions
-                stats["gate/health"] = "warning_no_differentiation"
-            else:
-                stats["gate/health"] = "ok"
 
         return stats
 
-    def reinit_gates(self, gate_init_bias: Optional[float] = None,
-                     residual_gate_init_bias: Optional[float] = None) -> int:
-        """Re-initialize all gate parameters to their intended initial values.
-
-        This is useful when loading from a checkpoint that was saved with
-        incorrect gate initialization (e.g., gate_B.bias=0 instead of 3.0).
-
-        Args:
-            gate_init_bias: Bias for MagGatedLinear gates. If None, uses config value.
-            residual_gate_init_bias: Bias for ResidualGate. If None, uses config value.
-
-        Returns:
-            Number of gate modules re-initialized.
-        """
-        if gate_init_bias is None:
-            gate_init_bias = getattr(self.config, 'gate_init_bias', 0.5)
+    def reinit_gates(self, residual_gate_init_bias: Optional[float] = None) -> int:
+        """Re-initialize all ResidualGate parameters."""
         if residual_gate_init_bias is None:
-            residual_gate_init_bias = getattr(self.config, 'residual_gate_init_bias', 2.0)
+            residual_gate_init_bias = self.config.residual_gate_init_bias
 
         count = 0
         for module in self.modules():
-            if isinstance(module, MagGatedLinear):
-                nn.init.normal_(module.gate_B.weight, std=0.01)
-                nn.init.constant_(module.gate_B.bias, gate_init_bias)
-                nn.init.normal_(module.gate_A.weight, std=0.1)
-                # Recalibrate m to match the gate init
-                gate_floor = getattr(module, 'gate_floor', 0.05)
-                effective_gate = module._initial_effective_gate(gate_init_bias, gate_floor)
-                if module.use_weight_norm:
-                    initial_m = 0.02 * math.sqrt(module.V.in_features) / effective_gate
-                else:
-                    initial_m = 1.0 / effective_gate
-                module.m.data.fill_(initial_m)
-                count += 1
-            elif isinstance(module, ResidualGate):
-                if hasattr(module, 'gate_B_alpha'):
-                    nn.init.normal_(module.gate_B_alpha.weight, std=0.01)
-                    nn.init.constant_(module.gate_B_alpha.bias, residual_gate_init_bias)
-                    nn.init.normal_(module.gate_B_beta.weight, std=0.01)
-                    nn.init.constant_(module.gate_B_beta.bias, residual_gate_init_bias)
-                elif hasattr(module, 'gate_B'):
-                    nn.init.normal_(module.gate_B.weight, std=0.01)
-                    nn.init.constant_(module.gate_B.bias, residual_gate_init_bias)
+            if isinstance(module, ResidualGate):
+                nn.init.normal_(module.gate_B_alpha.weight, std=0.01)
+                nn.init.constant_(module.gate_B_alpha.bias, residual_gate_init_bias)
+                nn.init.normal_(module.gate_B_beta.weight, std=0.01)
+                nn.init.constant_(module.gate_B_beta.bias, residual_gate_init_bias)
                 nn.init.normal_(module.gate_A.weight, std=0.02)
                 count += 1
 
         logger.info(
-            f"[MagGated] ✓ Re-initialized {count} gate modules "
-            f"(gate_init_bias={gate_init_bias}, residual_gate_init_bias={residual_gate_init_bias})"
+            f"[ResidualGate] ✓ Re-initialized {count} gate modules "
+            f"(init_bias={residual_gate_init_bias})"
         )
         return count
 
     def verify_gate_init(self) -> dict:
-        """Verify that gate parameters are correctly initialized.
-
-        Checks if gate_B.bias values match the expected init values from config.
-        Returns a dict with verification results.
-
-        This should be called after model loading to detect corrupted checkpoints.
-        """
-        gate_init_bias = getattr(self.config, 'gate_init_bias', 3.0)
-        residual_gate_init_bias = getattr(self.config, 'residual_gate_init_bias', 4.0)
-
-        mag_gate_biases = []
-        res_gate_biases = []
-        mag_gate_weight_stds = []
-        res_gate_weight_stds = []
+        """Verify that gate parameters are correctly initialized."""
+        expected_bias = self.config.residual_gate_init_bias
+        gate_biases = []
+        gate_weight_stds = []
 
         for module in self.modules():
-            if isinstance(module, MagGatedLinear):
-                mag_gate_biases.append(module.gate_B.bias.data.float().mean().item())
-                mag_gate_weight_stds.append(module.gate_B.weight.data.float().std().item())
-            elif isinstance(module, ResidualGate):
-                # Support both old (gate_B) and new (gate_B_alpha/gate_B_beta) ResidualGate
-                if hasattr(module, 'gate_B_alpha'):
-                    res_gate_biases.append(module.gate_B_alpha.bias.data.float().mean().item())
-                    res_gate_weight_stds.append(module.gate_B_alpha.weight.data.float().std().item())
-                elif hasattr(module, 'gate_B'):
-                    res_gate_biases.append(module.gate_B.bias.data.float().mean().item())
-                    res_gate_weight_stds.append(module.gate_B.weight.data.float().std().item())
+            if isinstance(module, ResidualGate):
+                gate_biases.append(module.gate_B_alpha.bias.data.float().mean().item())
+                gate_weight_stds.append(module.gate_B_alpha.weight.data.float().std().item())
 
         result = {
-            "mag_gate_count": len(mag_gate_biases),
-            "res_gate_count": len(res_gate_biases),
-            "expected_mag_bias": gate_init_bias,
-            "expected_res_bias": residual_gate_init_bias,
+            "gate_count": len(gate_biases),
+            "expected_bias": expected_bias,
         }
 
-        if mag_gate_biases:
-            avg_mag_bias = sum(mag_gate_biases) / len(mag_gate_biases)
-            avg_mag_w_std = sum(mag_gate_weight_stds) / len(mag_gate_weight_stds)
-            result["actual_mag_bias_mean"] = avg_mag_bias
-            result["actual_mag_weight_std"] = avg_mag_w_std
-            # Check if bias is close to expected (within 10%)
-            result["mag_bias_ok"] = abs(avg_mag_bias - gate_init_bias) < max(gate_init_bias * 0.3, 0.2)
-            # Check if weight std is reasonable (should be < 0.05 for fresh init)
-            result["mag_weight_ok"] = avg_mag_w_std < 0.05
-
-        if res_gate_biases:
-            avg_res_bias = sum(res_gate_biases) / len(res_gate_biases)
-            avg_res_w_std = sum(res_gate_weight_stds) / len(res_gate_weight_stds)
-            result["actual_res_bias_mean"] = avg_res_bias
-            result["actual_res_weight_std"] = avg_res_w_std
-            result["res_bias_ok"] = abs(avg_res_bias - residual_gate_init_bias) < max(residual_gate_init_bias * 0.3, 0.3)
-            result["res_weight_ok"] = avg_res_w_std < 0.05
-
-        # Overall health
-        all_ok = result.get("mag_bias_ok", True) and result.get("res_bias_ok", True)
-        result["all_ok"] = all_ok
-
-        if not all_ok:
-            logger.warning(
-                f"[MagGated] ⚠️  Gate initialization CORRUPTED!\n"
-                f"  MagGatedLinear gate_B.bias: expected={gate_init_bias:.1f}, "
-                f"actual={result.get('actual_mag_bias_mean', 'N/A'):.4f} "
-                f"({'OK' if result.get('mag_bias_ok', True) else 'WRONG'})\n"
-                f"  MagGatedLinear gate_B.weight std: {result.get('actual_mag_weight_std', 'N/A'):.6f} "
-                f"({'OK' if result.get('mag_weight_ok', True) else 'WRONG (should be ~0)'})\n"
-                f"  ResidualGate gate_B.bias: expected={residual_gate_init_bias:.1f}, "
-                f"actual={result.get('actual_res_bias_mean', 'N/A'):.4f} "
-                f"({'OK' if result.get('res_bias_ok', True) else 'WRONG'})\n"
-                f"  → Call model.reinit_gates() to fix this before training!"
-            )
+        if gate_biases:
+            avg_bias = sum(gate_biases) / len(gate_biases)
+            avg_w_std = sum(gate_weight_stds) / len(gate_weight_stds)
+            result["actual_bias_mean"] = avg_bias
+            result["actual_weight_std"] = avg_w_std
+            result["bias_ok"] = abs(avg_bias - expected_bias) < max(expected_bias * 0.3, 0.3)
+            result["weight_ok"] = avg_w_std < 0.05
+            result["all_ok"] = result["bias_ok"] and result["weight_ok"]
         else:
-            logger.info(
-                f"[MagGated] ✓ Gate initialization verified OK "
-                f"(mag_bias={result.get('actual_mag_bias_mean', 'N/A'):.2f}, "
-                f"res_bias={result.get('actual_res_bias_mean', 'N/A'):.2f})"
-            )
+            result["all_ok"] = True
 
         return result
-
-    def get_gate_param_groups(self, gate_lr_multiplier: float = 5.0) -> list:
-        """Return parameter groups with separate learning rate for gate parameters.
-
-        This enables adaptive gate learning — gate parameters (gate_A, gate_B)
-        get a higher learning rate to encourage faster differentiation.
-
-        Usage with HuggingFace Trainer:
-            # In your training script, after model creation:
-            param_groups = model.get_gate_param_groups(gate_lr_multiplier=5.0)
-            optimizer = AdamW(param_groups, lr=base_lr)
-
-        Args:
-            gate_lr_multiplier: Multiplier for gate parameter learning rate.
-                Default 5.0 means gate params learn 5x faster than other params.
-
-        Returns:
-            List of param group dicts for optimizer construction.
-        """
-        gate_params = []
-        gate_param_names = []
-        other_params = []
-        other_param_names = []
-
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            # Gate parameters: gate_A, gate_B in both MagGatedLinear and ResidualGate
-            if "gate_A" in name or "gate_B" in name:
-                gate_params.append(param)
-                gate_param_names.append(name)
-            else:
-                other_params.append(param)
-                other_param_names.append(name)
-
-        logger.info(
-            f"[MagGated] Gate param groups: {len(gate_params)} gate params "
-            f"(lr × {gate_lr_multiplier}), {len(other_params)} other params (base lr)"
-        )
-
-        return [
-            {"params": other_params, "lr_multiplier": 1.0},
-            {"params": gate_params, "lr_multiplier": gate_lr_multiplier,
-             "_gate_param_names": gate_param_names},
-        ]

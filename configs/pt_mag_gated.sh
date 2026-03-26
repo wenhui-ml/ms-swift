@@ -30,6 +30,8 @@ NPROC_PER_NODE=$nproc_per_node \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift pt \
     --model $MODEL_DIR \
+    --model_type qwen3 \
+    --template qwen3 \
     --tuner_type full \
     --dataset \
         /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_khan.jsonl \
@@ -49,7 +51,7 @@ swift pt \
     --save_steps 100 \
     --save_total_limit 5 \
     --logging_steps 5 \
-    --deepspeed zero1 \
+    --deepspeed zero0 \
     --max_length 4096 \
     --max_steps $MAX_STEPS \
     --warmup_ratio 0.05 \

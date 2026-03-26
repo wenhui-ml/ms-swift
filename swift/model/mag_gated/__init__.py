@@ -1,11 +1,10 @@
 # Copyright (c) 2024. All rights reserved.
-# Magnitude-Gated Transformer: Why Hidden Size Can Be 2-4x Smaller
+# ResidualGate Transformer
 from .configuration_mag_gated import MagGatedConfig
 from .modeling_mag_gated import (
     MagGatedForCausalLM,
     MagGatedModel,
     MagGatedDecoderLayer,
-    MagGatedLinear,
     ResidualGate,
 )
 from .gate_monitor_callback import MagGateMonitorCallback
@@ -15,7 +14,6 @@ __all__ = [
     "MagGatedForCausalLM",
     "MagGatedModel",
     "MagGatedDecoderLayer",
-    "MagGatedLinear",
     "ResidualGate",
     "MagGateMonitorCallback",
 ]

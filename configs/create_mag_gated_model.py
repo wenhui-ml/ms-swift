@@ -1,32 +1,24 @@
 #!/usr/bin/env python
-"""Create a from-scratch MagGated Transformer model checkpoint for pretraining.
-
-This script creates model configs and saves random-initialized checkpoints
-so ms-swift can load them for pretraining.
+"""Create a ResidualGate Transformer model checkpoint for pretraining.
 
 Usage:
-    # Create MagGated model (d=1024, gate_rank=16, all positions gated)
-    python create_mag_gated_model.py --variant mag_gated_all --hidden_size 1024
+    # Create ResidualGate model (d=1024, Qwen3-0.6B aligned)
+    python create_mag_gated_model.py \
+        --hidden_size 1024 --intermediate_size 3072 --num_hidden_layers 28 \
+        --num_attention_heads 16 --num_key_value_heads 8 --head_dim 128 \
+        --vocab_size 151936 --max_position_embeddings 40960 \
+        --torch_dtype bfloat16 \
+        --output_dir model_checkpoints/mag_gated-d1024-L28
 
-    # Create MagGated model (bottleneck only: o_proj + down_proj)
-    python create_mag_gated_model.py --variant mag_gated_bottleneck --hidden_size 1024
-
-    # Create standard baseline (no gates, same architecture)
-    python create_mag_gated_model.py --variant baseline --hidden_size 1024
-
-    # Create MagGated with smaller d (the core experiment)
-    python create_mag_gated_model.py --variant mag_gated_all --hidden_size 512
-
-    # Create using a preset
-    python create_mag_gated_model.py --preset qwen3-0.6b --variant baseline
+    # Create baseline (no ResidualGate, standard transformer)
+    python create_mag_gated_model.py --no_residual_gate \
+        --hidden_size 1024 --output_dir model_checkpoints/baseline-d1024-L28
 """
 
 import argparse
-import json
 import os
 import sys
 
-# Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
@@ -37,115 +29,43 @@ from swift.model.mag_gated.modeling_mag_gated import MagGatedForCausalLM
 
 
 def count_parameters(model):
-    """Count total and trainable parameters."""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
 
 def count_gate_parameters(model):
-    """Count parameters specifically from gate components."""
     gate_params = 0
-    mag_params = 0
-    residual_gate_params = 0
     for name, p in model.named_parameters():
         if 'gate_A' in name or 'gate_B' in name:
-            if 'residual_gate' in name:
-                residual_gate_params += p.numel()
-            else:
-                gate_params += p.numel()
-        elif name.endswith('.m'):
-            mag_params += p.numel()
-    return gate_params, mag_params, residual_gate_params
+            gate_params += p.numel()
+    return gate_params
 
 
 def create_model(args):
-    """Create and save a MagGated model checkpoint."""
+    """Create and save a ResidualGate model checkpoint."""
 
-    # Determine gate settings based on variant
-    if args.variant == 'baseline':
-        use_mag_gate = False
-        mag_gate_positions = 'none'
-        use_residual_gate = False
-    elif args.variant == 'mag_gated_all':
-        use_mag_gate = True
-        mag_gate_positions = 'all'
-        use_residual_gate = True
-    elif args.variant == 'mag_gated_bottleneck':
-        use_mag_gate = True
-        mag_gate_positions = 'bottleneck'
-        use_residual_gate = True
-    elif args.variant == 'residual_only':
-        use_mag_gate = False
-        mag_gate_positions = 'none'
-        use_residual_gate = True
-    else:
-        raise ValueError(f"Unknown variant: {args.variant}")
-
-    # Compute intermediate_size (roughly 3.5x hidden_size, rounded to multiple of 128)
+    # Compute intermediate_size if not specified
     if args.intermediate_size is None:
-        intermediate_size = int(args.hidden_size * 3.5)
+        intermediate_size = int(args.hidden_size * 3.0)
         intermediate_size = ((intermediate_size + 127) // 128) * 128
     else:
         intermediate_size = args.intermediate_size
 
-    # Compute num_attention_heads and num_key_value_heads
+    # Compute heads if not specified
     num_attention_heads = args.num_attention_heads
     head_dim = args.head_dim
-
     if num_attention_heads is None:
-        # Default: head_dim=128, adjust num_heads accordingly
         num_attention_heads = max(1, args.hidden_size // head_dim)
-    
-    # If head_dim is still None or we want to force d_model/n_heads (not the case for Qwen3)
     if head_dim is None:
-         head_dim = args.hidden_size // num_attention_heads
+        head_dim = args.hidden_size // num_attention_heads
 
-    if args.num_key_value_heads is None:
-        # GQA: use 1/4 of attention heads as KV heads, minimum 1
-        num_key_value_heads = max(1, num_attention_heads // 4)
-    else:
-        num_key_value_heads = args.num_key_value_heads
-
-    # Apply preset if provided (overrides other args if not explicitly set)
-    if args.preset:
-        print(f"Applying preset: {args.preset}")
-        if args.preset == 'qwen2.5-0.5b':
-            # Actual Qwen2.5-0.5B: d=896, L=24, intermediate=4864, n_h=14, n_kv=2
-            args.hidden_size = 896
-            args.num_hidden_layers = 24
-            args.intermediate_size = 4864
-            args.num_attention_heads = 14
-            args.num_key_value_heads = 2
-            args.vocab_size = 151936
-        elif args.preset == 'qwen3-0.6b':
-            # User's Qwen3-0.6B target: d=1024, L=28, intermediate=3072, n_h=16, n_kv=8
-            args.hidden_size = 1024
-            args.num_hidden_layers = 28
-            args.intermediate_size = 3072
-            args.num_attention_heads = 16
-            args.num_key_value_heads = 8
-            args.vocab_size = 151669
-        
-        # Re-derive intermediate/heads just in case
-        intermediate_size = args.intermediate_size
-        num_attention_heads = args.num_attention_heads
-        num_key_value_heads = args.num_key_value_heads
-        head_dim = args.head_dim if args.head_dim else (args.hidden_size // num_attention_heads)
-
-    # If tokenizer is provided, use its actual vocab size first
-    actual_vocab_size = args.vocab_size
-    tokenizer = None
-    if args.tokenizer_from:
-        print(f"Loading tokenizer from: {args.tokenizer_from}")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_from, trust_remote_code=True)
-        actual_vocab_size = len(tokenizer)
-        print(f"  Tokenizer actual vocab size: {actual_vocab_size}")
-        if actual_vocab_size != args.vocab_size:
-            print(f"  (Overriding --vocab_size {args.vocab_size} with tokenizer's {actual_vocab_size})")
+    num_key_value_heads = args.num_key_value_heads
+    if num_key_value_heads is None:
+        num_key_value_heads = max(1, num_attention_heads // 2)
 
     config = MagGatedConfig(
-        vocab_size=actual_vocab_size,
+        vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         intermediate_size=intermediate_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -159,11 +79,9 @@ def create_model(args):
         use_cache=True,
         tie_word_embeddings=args.tie_word_embeddings,
         rope_theta=1000000.0,
-        gate_rank=args.gate_rank,
-        use_mag_gate=use_mag_gate,
-        mag_gate_positions=mag_gate_positions,
-        use_residual_gate=use_residual_gate,
+        use_residual_gate=args.use_residual_gate,
         residual_gate_rank=args.residual_gate_rank,
+        residual_gate_init_bias=args.residual_gate_init_bias,
         max_window_layers=args.max_window_layers,
         use_sliding_window=args.use_sliding_window,
         sliding_window=args.sliding_window,
@@ -175,25 +93,24 @@ def create_model(args):
         attention_dropout=0.0,
     )
 
+    gate_status = "ON" if args.use_residual_gate else "OFF"
     print(f"\n{'='*60}")
-    print(f"Creating MagGated Transformer: {args.variant}")
+    print(f"Creating ResidualGate Transformer (gate={gate_status})")
     print(f"{'='*60}")
-    print(f"  hidden_size:       {config.hidden_size}")
-    print(f"  intermediate_size: {config.intermediate_size}")
-    print(f"  num_layers:        {config.num_hidden_layers}")
-    print(f"  num_attn_heads:    {config.num_attention_heads}")
-    print(f"  num_kv_heads:      {config.num_key_value_heads}")
-    print(f"  head_dim:          {config.head_dim}")
-    print(f"  use_mag_gate:      {config.use_mag_gate}")
-    print(f"  gate_positions:    {config.mag_gate_positions}")
-    print(f"  use_residual_gate: {config.use_residual_gate}")
-    print(f"  gate_rank:         {config.gate_rank}")
-    print(f"  residual_gate_rank:{config.residual_gate_rank}")
-    print(f"  tie_embeddings:    {config.tie_word_embeddings}")
-    print(f"  vocab_size:        {config.vocab_size}")
+    print(f"  hidden_size:           {config.hidden_size}")
+    print(f"  intermediate_size:     {config.intermediate_size}")
+    print(f"  num_layers:            {config.num_hidden_layers}")
+    print(f"  num_attn_heads:        {config.num_attention_heads}")
+    print(f"  num_kv_heads:          {config.num_key_value_heads}")
+    print(f"  head_dim:              {config.head_dim}")
+    print(f"  use_residual_gate:     {config.use_residual_gate}")
+    print(f"  residual_gate_rank:    {config.residual_gate_rank}")
+    print(f"  residual_gate_init_bias: {config.residual_gate_init_bias}")
+    print(f"  tie_embeddings:        {config.tie_word_embeddings}")
+    print(f"  vocab_size:            {config.vocab_size}")
+    print(f"  torch_dtype:           {config.torch_dtype}")
     print(f"{'='*60}")
 
-    # Create model
     print("\nInitializing model...")
     model = MagGatedForCausalLM(config)
 
@@ -206,19 +123,18 @@ def create_model(args):
         model = model.to(torch.float16)
 
     total_params, trainable_params = count_parameters(model)
-    gate_params, mag_params, residual_gate_params = count_gate_parameters(model)
+    gate_params = count_gate_parameters(model)
 
-    print(f"\n  Total parameters:          {total_params:>12,}  ({total_params/1e6:.1f}M)")
-    print(f"  Trainable parameters:      {trainable_params:>12,}  ({trainable_params/1e6:.1f}M)")
-    print(f"  Gate parameters:           {gate_params:>12,}  ({gate_params/1e6:.1f}M)")
-    print(f"  Magnitude parameters:      {mag_params:>12,}  ({mag_params/1e6:.1f}M)")
-    print(f"  Residual gate parameters:  {residual_gate_params:>12,}  ({residual_gate_params/1e6:.1f}M)")
-    print(f"  Gate overhead:             {(gate_params + mag_params + residual_gate_params) / total_params * 100:.2f}%")
+    print(f"\n  Total parameters:      {total_params:>12,}  ({total_params/1e6:.1f}M)")
+    print(f"  Trainable parameters:  {trainable_params:>12,}  ({trainable_params/1e6:.1f}M)")
+    print(f"  Gate parameters:       {gate_params:>12,}  ({gate_params/1e6:.1f}M)")
+    if total_params > 0:
+        print(f"  Gate overhead:         {gate_params / total_params * 100:.2f}%")
 
     # Save
     output_dir = args.output_dir
     if output_dir is None:
-        name = f"MagGated-{args.variant}-d{args.hidden_size}-L{args.num_hidden_layers}"
+        name = f"ResGate-d{args.hidden_size}-L{args.num_hidden_layers}"
         output_dir = os.path.join(os.path.dirname(__file__), '..', 'model_checkpoints', name)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -226,9 +142,10 @@ def create_model(args):
     print(f"\nSaving to: {output_dir}")
     model.save_pretrained(output_dir)
 
-    # Save tokenizer if loaded
-    if tokenizer is not None:
-        print(f"Saving tokenizer to: {output_dir}")
+    # Copy tokenizer if specified
+    if args.tokenizer_from:
+        print(f"Copying tokenizer from: {args.tokenizer_from}")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_from, trust_remote_code=True)
         tokenizer.save_pretrained(output_dir)
 
     print(f"\n✓ Model saved successfully!")
@@ -239,29 +156,23 @@ def create_model(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create MagGated Transformer checkpoint")
-    parser.add_argument('--variant', type=str, default='mag_gated_all',
-                        choices=['baseline', 'mag_gated_all', 'mag_gated_bottleneck', 'residual_only'],
-                        help='Model variant')
+    parser = argparse.ArgumentParser(description="Create ResidualGate Transformer checkpoint")
     parser.add_argument('--hidden_size', type=int, default=1024)
     parser.add_argument('--intermediate_size', type=int, default=None)
-    parser.add_argument('--num_hidden_layers', type=int, default=24)
+    parser.add_argument('--num_hidden_layers', type=int, default=28)
     parser.add_argument('--num_attention_heads', type=int, default=None)
     parser.add_argument('--num_key_value_heads', type=int, default=None)
     parser.add_argument('--head_dim', type=int, default=128)
-    parser.add_argument('--gate_rank', type=int, default=16)
     parser.add_argument('--residual_gate_rank', type=int, default=16)
-    parser.add_argument('--max_position_embeddings', type=int, default=8192)
-    parser.add_argument('--vocab_size', type=int, default=151936,
-                        help='Vocabulary size (default matches Qwen2)')
+    parser.add_argument('--residual_gate_init_bias', type=float, default=5.0)
+    parser.add_argument('--max_position_embeddings', type=int, default=40960)
+    parser.add_argument('--vocab_size', type=int, default=151936)
     parser.add_argument('--tie_word_embeddings', action='store_true', default=True)
     parser.add_argument('--no_tie_word_embeddings', dest='tie_word_embeddings', action='store_false')
+    parser.add_argument('--use_residual_gate', action='store_true', default=True)
+    parser.add_argument('--no_residual_gate', dest='use_residual_gate', action='store_false')
     parser.add_argument('--output_dir', type=str, default=None)
-    parser.add_argument('--tokenizer_from', type=str, default=None,
-                        help='Path to copy tokenizer from (e.g., Qwen/Qwen2.5-0.5B)')
-    parser.add_argument('--preset', type=str, default=None,
-                        choices=['qwen2.5-0.5b', 'qwen3-0.6b'],
-                        help='Architecture preset (overrides most other dimensions)')
+    parser.add_argument('--tokenizer_from', type=str, default=None)
     parser.add_argument('--max_window_layers', type=int, default=28)
     parser.add_argument('--use_sliding_window', action='store_true', default=False)
     parser.add_argument('--sliding_window', type=int, default=None)

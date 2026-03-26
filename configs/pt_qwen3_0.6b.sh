@@ -1,5 +1,5 @@
 MODEL_DIR=${1:-model_checkpoints/Qwen3-0.6B-standard}
-MAX_STEPS=${2:-10000}   
+MAX_STEPS=${2:-3500}   
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
@@ -37,7 +37,7 @@ swift pt \
     --save_steps 100 \
     --save_total_limit 5 \
     --logging_steps 5 \
-    --deepspeed zero1 \
+    --deepspeed zero0 \
     --max_length 4096 \
     --max_steps $MAX_STEPS \
     --warmup_ratio 0.05 \
