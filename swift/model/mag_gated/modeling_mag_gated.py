@@ -100,11 +100,13 @@ class ResidualGate(nn.Module):
     Output:
         h_new = (1 - forget) ⊙ h + accept ⊙ o
 
-    Initialization ensures near-identity start:
-        forget ≈ 0 (b_forget = -init_bias → sigmoid(-5) ≈ 0.007)
-        accept ≈ 1 (b_accept = +init_bias → sigmoid(+5) ≈ 0.993)
-        → h_new ≈ h + o (standard residual)
+    Initialization ensures near-identity start (with default init_bias=3.0):
+        forget ≈ 0 (b_forget = -init_bias → sigmoid(-3) ≈ 0.047)
+        accept ≈ 1 (b_accept = +init_bias → sigmoid(+3) ≈ 0.953)
+        → h_new ≈ 0.953·h + 0.953·o ≈ h + o (near-identity standard residual)
         → ∂h_new/∂h ≈ 1 (no gradient vanishing)
+        Note: init_bias=5.0 gives tighter near-identity (sigmoid(±5)≈0.007/0.993)
+              init_bias=3.0 allows faster gate divergence during training.
 
     Grouped query-key dot product provides cross-dimension interaction:
         score = Σ_{i∈group} w_q_i · key_i  (sums over group_size dimensions)
@@ -118,11 +120,13 @@ class ResidualGate(nn.Module):
 
     def __init__(self, hidden_size: int, n_groups: int = 16, init_bias: float = 5.0):
         super().__init__()
+        if hidden_size % n_groups != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by n_groups ({n_groups})"
+            )
         self.hidden_size = hidden_size
         self.n_groups = n_groups
         self.group_size = hidden_size // n_groups
-        assert hidden_size % n_groups == 0, \
-            f"hidden_size ({hidden_size}) must be divisible by n_groups ({n_groups})"
 
         # Q: per-group query vectors — "what does each group of dimensions need?"
         # Shape: (n_groups, group_size) — each group has a group_size-dim query
@@ -133,17 +137,17 @@ class ResidualGate(nn.Module):
         self.w_ko = nn.Parameter(torch.ones(hidden_size))   # init=1: key_o = o
 
         # Per-group biases for forget and accept gates
-        self.b_forget = nn.Parameter(torch.full((n_groups,), -init_bias))  # sigmoid(-5)≈0.007
-        self.b_accept = nn.Parameter(torch.full((n_groups,), init_bias))   # sigmoid(+5)≈0.993
+        self.b_forget = nn.Parameter(torch.full((n_groups,), -init_bias))
+        self.b_accept = nn.Parameter(torch.full((n_groups,), init_bias))
 
         # Learnable temperature τ (analogous to 1/√d_k)
         self.log_tau = nn.Parameter(torch.zeros(1))  # τ = exp(0) = 1
 
-        # Scaling factor (like √d_k in attention)
-        self.register_buffer('_scale', torch.tensor(self.group_size ** -0.5))
+        # Scaling factor (like √d_k in attention), stored as float32
+        self.register_buffer('_scale', torch.tensor(self.group_size ** -0.5, dtype=torch.float32))
 
-        # Gate monitoring
-        self._gate_stats: Optional[dict] = None
+        # Gate monitoring: raw tensors kept on GPU, computed lazily
+        self._gate_raw: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def forward(self, residual: torch.Tensor, new_output: torch.Tensor) -> torch.Tensor:
         """
@@ -153,9 +157,11 @@ class ResidualGate(nn.Module):
         Returns:
             updated: (*, d) - gated combination (1-forget)⊙h + accept⊙o
         """
-        # Save original shape for reshape at end (supports any leading dims)
         orig_shape = residual.shape
-        d = orig_shape[-1]
+        if orig_shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"Expected last dim={self.hidden_size}, got {orig_shape[-1]}"
+            )
 
         # K: per-dim key projection (element-wise, very fast)
         key_h = self.w_kh * residual      # (*, d)
@@ -168,8 +174,8 @@ class ResidualGate(nn.Module):
         # Q·K / (τ·√group_size): grouped dot product with scaling
         # w_q: (n_groups, group_size), key_*_g: (*, n_groups, group_size)
         # Result: (*, n_groups) — one score per group
-        tau = self.log_tau.exp()
-        scale = self._scale / (tau + 1e-8)  # combined scaling
+        tau = self.log_tau.float().exp()
+        scale = self._scale / (tau + 1e-8)  # combined scaling, both float32
 
         score_h = (self.w_q * key_h_g).sum(dim=-1) * scale  # (*, n_groups)
         score_o = (self.w_q * key_o_g).sum(dim=-1) * scale  # (*, n_groups)
@@ -180,40 +186,52 @@ class ResidualGate(nn.Module):
         forget = torch.sigmoid(score_h + self.b_forget)  # (*, n_groups), init ≈ 0
         accept = torch.sigmoid(score_o + self.b_accept)  # (*, n_groups), init ≈ 1
 
-        # Expand group-level gates to per-dim: (*, n_groups) → (*, d)
-        forget = forget.unsqueeze(-1).expand(
-            *orig_shape[:-1], self.n_groups, self.group_size
-        ).reshape(orig_shape)  # (*, d)
-        accept = accept.unsqueeze(-1).expand(
-            *orig_shape[:-1], self.n_groups, self.group_size
-        ).reshape(orig_shape)  # (*, d)
+        # Gated residual using broadcasting on group dimension
+        # Reshape residual/output to (*, n_groups, group_size), broadcast gates
+        residual_g = residual.view(*orig_shape[:-1], self.n_groups, self.group_size)
+        output_g = new_output.view(*orig_shape[:-1], self.n_groups, self.group_size)
 
-        # h_new = (1 - forget) ⊙ h + accept ⊙ o
-        result = (1.0 - forget) * residual + accept * new_output
+        # forget/accept: (*, n_groups) → (*, n_groups, 1) for broadcasting
+        result = (1.0 - forget.unsqueeze(-1)) * residual_g + accept.unsqueeze(-1) * output_g
+        result = result.view(orig_shape)  # (*, d)
 
-        # Record gate statistics for monitoring
+        # Save raw gate tensors for lazy stats collection (no GPU-CPU sync here)
         if self.training:
-            with torch.no_grad():
-                f = forget.detach().float()
-                a = accept.detach().float()
-                self._gate_stats = {
-                    "mean": (1.0 - f).mean().item(),       # retain rate
-                    "std": (1.0 - f).std().item(),
-                    "min": (1.0 - f).min().item(),
-                    "max": (1.0 - f).max().item(),
-                    "sparsity": (f > 0.9).float().mean().item(),    # high forget = sparsity
-                    "saturation": (f < 0.1).float().mean().item(),  # low forget = saturation
-                    "forget_ratio": (f > 0.5).float().mean().item(),
-                    "dim_mean": (1.0 - f).mean(dim=tuple(range(f.dim() - 1))).cpu() if f.dim() > 1 else f.cpu(),
-                    "beta_mean": a.mean().item(),           # accept rate
-                    "beta_std": a.std().item(),
-                    "beta_min": a.min().item(),
-                    "beta_max": a.max().item(),
-                    "beta_sparsity": (a < 0.1).float().mean().item(),
-                    "beta_saturation": (a > 0.9).float().mean().item(),
-                }
+            self._gate_raw = (forget.detach(), accept.detach())
 
         return result
+
+    @property
+    def _gate_stats(self) -> Optional[dict]:
+        """Lazily compute gate statistics from raw tensors (triggers GPU-CPU sync only when accessed)."""
+        if self._gate_raw is None:
+            return None
+        f_groups, a_groups = self._gate_raw  # (*, n_groups)
+        with torch.no_grad():
+            f = f_groups.float()
+            a = a_groups.float()
+            retain = 1.0 - f
+            return {
+                "mean": retain.mean().item(),           # retain rate
+                "std": retain.std().item(),
+                "min": retain.min().item(),
+                "max": retain.max().item(),
+                "sparsity": (f > 0.9).float().mean().item(),    # high forget = sparsity
+                "saturation": (f < 0.1).float().mean().item(),  # low forget = saturation
+                "forget_ratio": (f > 0.5).float().mean().item(),
+                "beta_mean": a.mean().item(),           # accept rate
+                "beta_std": a.std().item(),
+                "beta_min": a.min().item(),
+                "beta_max": a.max().item(),
+                "beta_sparsity": (a < 0.1).float().mean().item(),
+                "beta_saturation": (a > 0.9).float().mean().item(),
+            }
+
+    @_gate_stats.setter
+    def _gate_stats(self, value):
+        """Allow setting _gate_stats to None for reset."""
+        if value is None:
+            self._gate_raw = None
 
 
 # ==============================================================================

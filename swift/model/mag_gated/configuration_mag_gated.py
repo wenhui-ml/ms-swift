@@ -57,7 +57,8 @@ class MagGatedConfig(PretrainedConfig):
             - b_accept = +init_bias → sigmoid(+init_bias) ≈ 1 (full acceptance)
             - h_new ≈ h + o (near-identity standard residual)
             - ∂h_new/∂h ≈ 1 (no gradient vanishing at initialization)
-            Recommended: 3.0 (faster gate divergence) or 5.0 (slower, more stable).
+            Default: 3.0 → sigmoid(±3) ≈ 0.047/0.953 (faster gate divergence).
+            Alternative: 5.0 → sigmoid(±5) ≈ 0.007/0.993 (tighter near-identity, slower divergence).
         attention_bias: Whether to use bias in attention projections.
         mlp_bias: Whether to use bias in MLP projections.
         attention_dropout: Dropout rate for attention.
