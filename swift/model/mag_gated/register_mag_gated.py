@@ -1,10 +1,14 @@
 # Copyright (c) 2024. All rights reserved.
-# Register MagGated Transformer model in ms-swift
-"""Registration of MagGated Transformer for ms-swift training pipeline.
+# Register Attention Hidden-Size Residual Gate Transformer in ms-swift
+"""Registration of AttnResGate Transformer for ms-swift training pipeline.
+
+This model uses grouped attention over the hidden-size dimension to compute
+selective residual gates, replacing the standard h = h + o with:
+    h_new = (1 - forget) ⊙ h + accept ⊙ o
 
 Auto-registers:
-1. MagGated model with HuggingFace AutoClasses
-2. MagGateMonitorCallback into Trainer (via monkey-patch)
+1. AttnResGate (mag_gated) model with HuggingFace AutoClasses
+2. MagGateMonitorCallback (AttnResGate monitor) into Trainer (via monkey-patch)
 """
 
 import logging
@@ -109,7 +113,7 @@ def auto_inject_gate_monitor():
         _original_train = Trainer.train
 
         def _patched_train(self, *args, **kwargs):
-            inject_gate_monitor_callback(self, log_every_n_steps=50, detail_every_n_steps=100)
+            inject_gate_monitor_callback(self, log_every_n_steps=20, detail_every_n_steps=20)
             return _original_train(self, *args, **kwargs)
 
         Trainer.train = _patched_train

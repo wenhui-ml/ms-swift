@@ -1,14 +1,20 @@
 # Copyright (c) 2024. All rights reserved.
-# ResidualGate Transformer Model Implementation
+# Attention Residual Gate Transformer Model Implementation
 """
-ResidualGate Transformer: Qwen3-compatible decoder-only model with dual-gated
-magnitude-aware residual connections.
+AttnResGate Transformer: Qwen3-compatible decoder-only model with grouped
+attention-based residual gates at each residual connection.
 
 Core mechanism (replaces standard h = h + o):
-    h_new = α(h, o) ⊙ h + β(h, o) ⊙ o
+    h_new = (1 - forget) ⊙ h + accept ⊙ o
 
-where α and β are independently computed per-dimension gates informed by
-DoRA-inspired magnitude/direction signals.
+where forget and accept are computed via grouped attention over h and o,
+following self-attention principles applied to the hidden-size dimension:
+    Q: per-group learned query w_q (n_groups × group_size)
+    K: per-dim projections key_h = w_kh ⊙ h, key_o = w_ko ⊙ o
+    Score: (w_q * key_g).sum(group_dim) / (τ·√group_size)  ← true dot product
+    forget = sigmoid(score_h + b_forget)  ← h-based, initially ≈0
+    accept = sigmoid(score_o + b_accept)  ← o-based, initially ≈1
+    → h_new ≈ h + o at init (near-identity), ∂h_new/∂h ≈ 1 (no grad vanish)
 
 All linear layers are standard nn.Linear — the ONLY architectural difference
 from Qwen3 is the ResidualGate at each residual connection.
@@ -17,6 +23,7 @@ Supports:
 - Flash Attention 2/3 via transformers ALL_ATTENTION_FUNCTIONS dispatch
 - Packing/padding_free training via FlashAttentionKwargs (cu_seq_lens_q/k)
 - SDPA, eager, flex_attention backends
+- torch.compile (all ops are standard PyTorch element-wise/reduction)
 """
 
 import math
@@ -77,101 +84,140 @@ logger = logging.get_logger(__name__)
 # ==============================================================================
 
 class ResidualGate(nn.Module):
-    """Dual-gate magnitude-aware residual connection.
+    """Grouped attention residual connection.
 
-    h_new = α(h, o) ⊙ h + β(h, o) ⊙ o
+    Applies self-attention principles to the hidden-size dimension for
+    selective information retention and acceptance at each residual connection.
 
-    where:
-        α ∈ (0,1)^d = retain gate (how much old info to keep per dimension)
-        β ∈ (0,1)^d = accept gate (how much new info to accept per dimension)
+    Architecture (maps to self-attention):
+        Q (query):   per-group learned query w_q ∈ R^{n_groups × group_size}
+        K (keys):    per-dim projections: key_h = w_kh ⊙ h, key_o = w_ko ⊙ o
+        Q·K^T/√d_k:  grouped dot product with √group_size scaling + temperature τ
+        Gate:        independent forget/accept sigmoids (not softmax, to preserve
+                     gradient flow and enable near-identity initialization)
+        V (values):  h and o themselves
 
-    Gate input is concat([h, o, mag_ratio, dir_agree]) → 4d, compressed through
-    a shared low-rank bottleneck (Gate_A: 4d→rank) then split into two independent
-    projections (Gate_B_alpha: rank→d, Gate_B_beta: rank→d).
+    Output:
+        h_new = (1 - forget) ⊙ h + accept ⊙ o
 
-    DoRA-inspired signals (detached, no gradient):
-        mag_ratio = |h| / (|h| + |o| + ε)   — relative strength per dimension
-        dir_agree = (h·o) / (|h|·|o| + ε)   — directional agreement per dimension
+    Initialization ensures near-identity start:
+        forget ≈ 0 (b_forget = -init_bias → sigmoid(-5) ≈ 0.007)
+        accept ≈ 1 (b_accept = +init_bias → sigmoid(+5) ≈ 0.993)
+        → h_new ≈ h + o (standard residual)
+        → ∂h_new/∂h ≈ 1 (no gradient vanishing)
 
-    init_bias=5.0 → sigmoid(5)≈0.993 → initial h_new ≈ 0.993h + 0.993o ≈ h + o
+    Grouped query-key dot product provides cross-dimension interaction:
+        score = Σ_{i∈group} w_q_i · key_i  (sums over group_size dimensions)
+        This is a true vector dot product, not a scalar multiplication.
+
+    All operations are standard PyTorch element-wise/reduction ops,
+    fully compatible with flash-attention, packing, and torch.compile.
+
+    Parameters per gate: 3d + 2·n_groups + 1 (d=1024, n_groups=16 → ~3K)
     """
 
-    def __init__(self, hidden_size: int, rank: int = 16, init_bias: float = 5.0):
+    def __init__(self, hidden_size: int, n_groups: int = 16, init_bias: float = 5.0):
         super().__init__()
         self.hidden_size = hidden_size
+        self.n_groups = n_groups
+        self.group_size = hidden_size // n_groups
+        assert hidden_size % n_groups == 0, \
+            f"hidden_size ({hidden_size}) must be divisible by n_groups ({n_groups})"
 
-        # Gate input: concat(h, o, mag_ratio, dir_agree) → 4d
-        gate_input_size = hidden_size * 4
+        # Q: per-group query vectors — "what does each group of dimensions need?"
+        # Shape: (n_groups, group_size) — each group has a group_size-dim query
+        self.w_q = nn.Parameter(torch.zeros(n_groups, self.group_size))
 
-        # Shared low-rank projection (parameter efficient)
-        self.gate_A = nn.Linear(gate_input_size, rank, bias=False)
-        # Two independent output projections for α and β
-        self.gate_B_alpha = nn.Linear(rank, hidden_size, bias=True)
-        self.gate_B_beta = nn.Linear(rank, hidden_size, bias=True)
+        # K: per-dim key projections for h and o
+        self.w_kh = nn.Parameter(torch.ones(hidden_size))   # init=1: key_h = h
+        self.w_ko = nn.Parameter(torch.ones(hidden_size))   # init=1: key_o = o
 
-        # Careful initialization:
-        # - gate_B weights ≈ 0 (small random noise for symmetry breaking)
-        # - gate_B bias = init_bias → sigmoid(5.0) ≈ 0.993 (near-identity start)
-        # - gate_A weights: moderate std for gradient flow
-        nn.init.normal_(self.gate_B_alpha.weight, std=0.01)
-        nn.init.constant_(self.gate_B_alpha.bias, init_bias)
-        nn.init.normal_(self.gate_B_beta.weight, std=0.01)
-        nn.init.constant_(self.gate_B_beta.bias, init_bias)
-        nn.init.normal_(self.gate_A.weight, std=0.02)
+        # Per-group biases for forget and accept gates
+        self.b_forget = nn.Parameter(torch.full((n_groups,), -init_bias))  # sigmoid(-5)≈0.007
+        self.b_accept = nn.Parameter(torch.full((n_groups,), init_bias))   # sigmoid(+5)≈0.993
 
-        # Gate monitoring (lightweight, no gradient)
+        # Learnable temperature τ (analogous to 1/√d_k)
+        self.log_tau = nn.Parameter(torch.zeros(1))  # τ = exp(0) = 1
+
+        # Scaling factor (like √d_k in attention)
+        self.register_buffer('_scale', torch.tensor(self.group_size ** -0.5))
+
+        # Gate monitoring
         self._gate_stats: Optional[dict] = None
 
     def forward(self, residual: torch.Tensor, new_output: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            residual: (B, T, d) - the residual stream (h)
-            new_output: (B, T, d) - output from attention/FFN sub-layer (o)
+            residual: (*, d) - the residual stream (h)
+            new_output: (*, d) - output from attention/FFN sub-layer (o)
         Returns:
-            updated: (B, T, d) - dual-gated combination α⊙h + β⊙o
+            updated: (*, d) - gated combination (1-forget)⊙h + accept⊙o
         """
-        # DoRA-inspired signals (DETACHED — read-only physics sensors, no gradient)
-        eps = 1e-6
-        h_mag = residual.detach().abs()
-        o_mag = new_output.detach().abs()
-        mag_ratio = h_mag / (h_mag + o_mag + eps)                              # ∈ [0, 1]
-        dir_agree = (residual.detach() * new_output.detach()) / (h_mag * o_mag + eps)  # ∈ [-1, 1]
+        # Save original shape for reshape at end (supports any leading dims)
+        orig_shape = residual.shape
+        d = orig_shape[-1]
 
-        # Gate input: h and o carry gradient; mag/dir are detached hints
-        gate_input = torch.cat([residual, new_output, mag_ratio, dir_agree], dim=-1)  # (B, T, 4d)
+        # K: per-dim key projection (element-wise, very fast)
+        key_h = self.w_kh * residual      # (*, d)
+        key_o = self.w_ko * new_output    # (*, d)
 
-        # Shared low-rank compression → independent α and β
-        gate_hidden = self.gate_A(gate_input)                                  # (B, T, rank)
-        alpha = torch.sigmoid(self.gate_B_alpha(gate_hidden))                  # (B, T, d)
-        beta = torch.sigmoid(self.gate_B_beta(gate_hidden))                    # (B, T, d)
+        # Reshape to groups: (*, n_groups, group_size)
+        key_h_g = key_h.view(*orig_shape[:-1], self.n_groups, self.group_size)
+        key_o_g = key_o.view(*orig_shape[:-1], self.n_groups, self.group_size)
+
+        # Q·K / (τ·√group_size): grouped dot product with scaling
+        # w_q: (n_groups, group_size), key_*_g: (*, n_groups, group_size)
+        # Result: (*, n_groups) — one score per group
+        tau = self.log_tau.exp()
+        scale = self._scale / (tau + 1e-8)  # combined scaling
+
+        score_h = (self.w_q * key_h_g).sum(dim=-1) * scale  # (*, n_groups)
+        score_o = (self.w_q * key_o_g).sum(dim=-1) * scale  # (*, n_groups)
+
+        # Independent forget/accept gates (sigmoid, not softmax)
+        # forget: based on h's features — "should we forget old info in this group?"
+        # accept: based on o's features — "should we accept new info in this group?"
+        forget = torch.sigmoid(score_h + self.b_forget)  # (*, n_groups), init ≈ 0
+        accept = torch.sigmoid(score_o + self.b_accept)  # (*, n_groups), init ≈ 1
+
+        # Expand group-level gates to per-dim: (*, n_groups) → (*, d)
+        forget = forget.unsqueeze(-1).expand(
+            *orig_shape[:-1], self.n_groups, self.group_size
+        ).reshape(orig_shape)  # (*, d)
+        accept = accept.unsqueeze(-1).expand(
+            *orig_shape[:-1], self.n_groups, self.group_size
+        ).reshape(orig_shape)  # (*, d)
+
+        # h_new = (1 - forget) ⊙ h + accept ⊙ o
+        result = (1.0 - forget) * residual + accept * new_output
 
         # Record gate statistics for monitoring
         if self.training:
             with torch.no_grad():
-                a = alpha.detach().float()
-                b = beta.detach().float()
+                f = forget.detach().float()
+                a = accept.detach().float()
                 self._gate_stats = {
-                    "mean": a.mean().item(),
-                    "std": a.std().item(),
-                    "min": a.min().item(),
-                    "max": a.max().item(),
-                    "sparsity": (a < 0.1).float().mean().item(),
-                    "saturation": (a > 0.9).float().mean().item(),
-                    "forget_ratio": (a < 0.5).float().mean().item(),
-                    "dim_mean": a.mean(dim=(0, 1)).cpu(),
-                    "beta_mean": b.mean().item(),
-                    "beta_std": b.std().item(),
-                    "beta_min": b.min().item(),
-                    "beta_max": b.max().item(),
-                    "beta_sparsity": (b < 0.1).float().mean().item(),
-                    "beta_saturation": (b > 0.9).float().mean().item(),
+                    "mean": (1.0 - f).mean().item(),       # retain rate
+                    "std": (1.0 - f).std().item(),
+                    "min": (1.0 - f).min().item(),
+                    "max": (1.0 - f).max().item(),
+                    "sparsity": (f > 0.9).float().mean().item(),    # high forget = sparsity
+                    "saturation": (f < 0.1).float().mean().item(),  # low forget = saturation
+                    "forget_ratio": (f > 0.5).float().mean().item(),
+                    "dim_mean": (1.0 - f).mean(dim=tuple(range(f.dim() - 1))).cpu() if f.dim() > 1 else f.cpu(),
+                    "beta_mean": a.mean().item(),           # accept rate
+                    "beta_std": a.std().item(),
+                    "beta_min": a.min().item(),
+                    "beta_max": a.max().item(),
+                    "beta_sparsity": (a < 0.1).float().mean().item(),
+                    "beta_saturation": (a > 0.9).float().mean().item(),
                 }
 
-        return alpha * residual + beta * new_output
+        return result
 
 
 # ==============================================================================
-# RMSNorm
+# RMSNorm (standard, same as Qwen3)
 # ==============================================================================
 
 class MagGatedRMSNorm(nn.Module):
@@ -189,7 +235,7 @@ class MagGatedRMSNorm(nn.Module):
 
 
 # ==============================================================================
-# Rotary Position Embedding
+# Rotary Position Embedding (standard, same as Qwen3)
 # ==============================================================================
 
 class MagGatedRotaryEmbedding(nn.Module):
@@ -265,11 +311,16 @@ def eager_attention_forward(
 
 
 # ==============================================================================
-# Attention (standard nn.Linear, identical to Qwen3)
+# Token-Sequence Attention (standard nn.Linear, identical to Qwen3)
+# Note: "Attention" here means the standard token-sequence self-attention,
+# NOT the hidden-size attention gate. The hidden-size attention is in ResidualGate.
 # ==============================================================================
 
 class MagGatedAttention(nn.Module):
-    """Multi-head attention with standard nn.Linear projections.
+    """Standard multi-head token-sequence attention with nn.Linear projections.
+
+    This is the standard Qwen3 self-attention (token × token), unchanged.
+    The hidden-size dimension attention gate is in ResidualGate, not here.
 
     Supports flash_attention_2/3, sdpa, eager, flex_attention
     via transformers ALL_ATTENTION_FUNCTIONS dispatch.
@@ -348,7 +399,7 @@ class MagGatedAttention(nn.Module):
 # ==============================================================================
 
 class MagGatedMLP(nn.Module):
-    """SwiGLU MLP with standard nn.Linear projections."""
+    """Standard SwiGLU MLP with nn.Linear projections (identical to Qwen3)."""
 
     def __init__(self, config: MagGatedConfig):
         super().__init__()
@@ -366,15 +417,19 @@ class MagGatedMLP(nn.Module):
 
 
 # ==============================================================================
-# Decoder Layer
+# Decoder Layer — with Attention Hidden-Size Residual Gate
 # ==============================================================================
 
 class MagGatedDecoderLayer(GradientCheckpointingLayer):
-    """Transformer decoder layer with ResidualGate.
+    """Transformer decoder layer with Attention Hidden-Size ResidualGate.
 
     Structure:
-        h → norm1 → Attn → ResidualGate(h, attn_out) → h'
-        h'→ norm2 → MLP  → ResidualGate(h', ffn_out) → h''
+        h → norm1 → TokenAttn → ResidualGate(h, attn_out) → h'
+        h'→ norm2 → MLP       → ResidualGate(h', ffn_out) → h''
+
+    The ResidualGate uses grouped attention over the hidden-size dimension:
+        Q·K score per group → forget/accept sigmoid gates
+        h_new = (1-forget)⊙h + accept⊙o
     """
 
     def __init__(self, config: MagGatedConfig, layer_idx: int):
@@ -389,9 +444,9 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
         self.use_residual_gate = config.use_residual_gate
         if self.use_residual_gate:
             init_bias = config.residual_gate_init_bias
-            rank = config.residual_gate_rank
-            self.attn_residual_gate = ResidualGate(config.hidden_size, rank=rank, init_bias=init_bias)
-            self.ffn_residual_gate = ResidualGate(config.hidden_size, rank=rank, init_bias=init_bias)
+            n_groups = config.residual_gate_n_groups
+            self.attn_residual_gate = ResidualGate(config.hidden_size, n_groups=n_groups, init_bias=init_bias)
+            self.ffn_residual_gate = ResidualGate(config.hidden_size, n_groups=n_groups, init_bias=init_bias)
 
     def forward(
         self,
@@ -437,7 +492,7 @@ class MagGatedDecoderLayer(GradientCheckpointingLayer):
 
 
 # ==============================================================================
-# Full Model
+# Full Model — Attention Hidden-Size Residual Gate Transformer
 # ==============================================================================
 
 class MagGatedPreTrainedModel(PreTrainedModel):
@@ -455,10 +510,8 @@ class MagGatedPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        # Skip init for internal linear layers of ResidualGate as they are carefully initialized
-        if hasattr(module, "_is_residual_gate_linear"):
-            return
-            
+        # ResidualGate uses nn.Parameter (not nn.Linear), so _init_weights
+        # naturally skips its parameters. No special handling needed.
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -470,7 +523,14 @@ class MagGatedPreTrainedModel(PreTrainedModel):
 
 
 class MagGatedModel(MagGatedPreTrainedModel):
-    """ResidualGate Transformer model (decoder-only, no LM head)."""
+    """Attention Hidden-Size Residual Gate Transformer (decoder-only, no LM head).
+
+    A Qwen3-compatible model where each residual connection h = h + o is
+    replaced by a grouped attention-based gate:
+        h_new = (1 - forget) ⊙ h + accept ⊙ o
+    where forget and accept are computed via grouped Q·K attention over
+    the hidden-size dimension.
+    """
 
     def __init__(self, config: MagGatedConfig):
         super().__init__(config)
@@ -489,15 +549,8 @@ class MagGatedModel(MagGatedPreTrainedModel):
         )
 
         self.gradient_checkpointing = False
-
-        # Mark all ResidualGate linears BEFORE post_init() so they are
-        # skipped by _init_weights (which is called inside post_init).
-        for name, module in self.named_modules():
-            if isinstance(module, ResidualGate):
-                module.gate_A._is_residual_gate_linear = True
-                module.gate_B_alpha._is_residual_gate_linear = True
-                module.gate_B_beta._is_residual_gate_linear = True
-
+        # V4 ResidualGate uses nn.Parameter (not nn.Linear), so _init_weights
+        # naturally skips gate parameters. No marking needed.
         self.post_init()
 
     def get_input_embeddings(self):
@@ -648,7 +701,12 @@ class MagGatedModel(MagGatedPreTrainedModel):
 
 
 class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
-    """ResidualGate Transformer with causal language model head."""
+    """Attention Hidden-Size Residual Gate Transformer with causal language model head.
+
+    Qwen3-compatible decoder-only LM where every residual connection h = h + o
+    is replaced by a grouped attention-based gate (ResidualGate):
+        h_new = (1 - forget) ⊙ h + accept ⊙ o
+    """
 
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -785,17 +843,21 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
                     gs = gate._gate_stats
                     prefix = f"gate/layer{layer_idx}_{gate_name}"
 
-                    # α (retain gate) stats
-                    for k in ["mean", "std", "min", "max", "sparsity", "saturation"]:
+                    # Retain (1-forget) stats
+                    for k in ["mean", "std", "min", "max", "sparsity", "saturation", "forget_ratio"]:
                         if k in gs:
                             stats[f"{prefix}_{k}"] = gs[k]
 
-                    # β (accept gate) stats
+                    # Accept stats
                     prefix_beta = f"gate/layer{layer_idx}_{gate_name}_beta"
                     for k in ["beta_mean", "beta_std", "beta_min", "beta_max", "beta_sparsity", "beta_saturation"]:
                         if k in gs:
                             short_k = k.replace("beta_", "")
                             stats[f"{prefix_beta}_{short_k}"] = gs[k]
+
+                    # Temperature τ
+                    tau = gate.log_tau.exp().item()
+                    stats[f"{prefix}_tau"] = tau
 
                     # Collect for global summary
                     res_alpha_means.append(gs["mean"])
@@ -823,18 +885,19 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
         return stats
 
     def reinit_gates(self, residual_gate_init_bias: Optional[float] = None) -> int:
-        """Re-initialize all ResidualGate parameters."""
+        """Re-initialize all ResidualGate parameters (grouped attention gate)."""
         if residual_gate_init_bias is None:
             residual_gate_init_bias = self.config.residual_gate_init_bias
 
         count = 0
         for module in self.modules():
             if isinstance(module, ResidualGate):
-                nn.init.normal_(module.gate_B_alpha.weight, std=0.01)
-                nn.init.constant_(module.gate_B_alpha.bias, residual_gate_init_bias)
-                nn.init.normal_(module.gate_B_beta.weight, std=0.01)
-                nn.init.constant_(module.gate_B_beta.bias, residual_gate_init_bias)
-                nn.init.normal_(module.gate_A.weight, std=0.02)
+                nn.init.zeros_(module.w_q)
+                nn.init.ones_(module.w_kh)
+                nn.init.ones_(module.w_ko)
+                nn.init.constant_(module.b_forget, -residual_gate_init_bias)
+                nn.init.constant_(module.b_accept, residual_gate_init_bias)
+                nn.init.zeros_(module.log_tau)
                 count += 1
 
         logger.info(
@@ -844,29 +907,29 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
         return count
 
     def verify_gate_init(self) -> dict:
-        """Verify that gate parameters are correctly initialized."""
-        expected_bias = self.config.residual_gate_init_bias
-        gate_biases = []
-        gate_weight_stds = []
+        """Verify that gate parameters are correctly initialized (grouped attention gate)."""
+        gate_count = 0
+        query_maxabs = []
+        accept_biases = []
 
         for module in self.modules():
             if isinstance(module, ResidualGate):
-                gate_biases.append(module.gate_B_alpha.bias.data.float().mean().item())
-                gate_weight_stds.append(module.gate_B_alpha.weight.data.float().std().item())
+                gate_count += 1
+                query_maxabs.append(module.w_q.data.float().abs().max().item())
+                accept_biases.append(module.b_accept.data.float().mean().item())
 
         result = {
-            "gate_count": len(gate_biases),
-            "expected_bias": expected_bias,
+            "gate_count": gate_count,
         }
 
-        if gate_biases:
-            avg_bias = sum(gate_biases) / len(gate_biases)
-            avg_w_std = sum(gate_weight_stds) / len(gate_weight_stds)
-            result["actual_bias_mean"] = avg_bias
-            result["actual_weight_std"] = avg_w_std
-            result["bias_ok"] = abs(avg_bias - expected_bias) < max(expected_bias * 0.3, 0.3)
-            result["weight_ok"] = avg_w_std < 0.05
-            result["all_ok"] = result["bias_ok"] and result["weight_ok"]
+        if query_maxabs:
+            avg_q_max = sum(query_maxabs) / len(query_maxabs)
+            avg_accept = sum(accept_biases) / len(accept_biases)
+            result["query_maxabs"] = avg_q_max
+            result["accept_bias_mean"] = avg_accept
+            result["query_ok"] = avg_q_max < 0.05
+            result["accept_ok"] = avg_accept > 3.0  # should be near init_bias (5.0)
+            result["all_ok"] = result["query_ok"] and result["accept_ok"]
         else:
             result["all_ok"] = True
 

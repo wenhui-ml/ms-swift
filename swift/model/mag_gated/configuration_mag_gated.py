@@ -1,23 +1,35 @@
 # Copyright (c) 2024. All rights reserved.
-# ResidualGate Transformer Configuration
-"""Configuration for ResidualGate Transformer model.
+# AttnResGate Transformer Configuration
+"""Configuration for Attention Residual Gate Transformer model.
 
 Pure Qwen3-compatible architecture with one core enhancement:
-    ResidualGate — dual-gate magnitude-aware residual connection.
-    h_new = α(h, o) ⊙ h + β(h, o) ⊙ o
+    ResidualGate — grouped attention-based residual gate.
+    h_new = (1 - forget) ⊙ h + accept ⊙ o
 
-All linear layers are standard nn.Linear (no MagGatedLinear).
+Gate values are computed via grouped query-key attention over h and o,
+following self-attention principles applied to the hidden-size dimension:
+    Q: per-group learned query w_q
+    K: per-dim projections key_h = w_kh ⊙ h, key_o = w_ko ⊙ o
+    Score: grouped dot product Q·K / (τ·√group_size)
+    forget = sigmoid(score_h + b_forget)  ← based on h's features
+    accept = sigmoid(score_o + b_accept)  ← based on o's features
+
+All linear layers are standard nn.Linear.
 """
 
 from transformers import PretrainedConfig
 
 
 class MagGatedConfig(PretrainedConfig):
-    """Configuration class for ResidualGate Transformer.
+    """Configuration class for Attention Residual Gate Transformer.
 
     This model is identical to Qwen3 except for the ResidualGate mechanism
     that replaces the standard additive residual connection (h + o) with
-    a dual-gated combination: α⊙h + β⊙o.
+    a grouped attention-gated combination:
+        h_new = (1 - forget) ⊙ h + accept ⊙ o
+
+    The gate uses grouped attention principles (Q·K/√d_k, temperature scaling)
+    to compute data-dependent, cross-dimension-aware forget/accept gates.
 
     Args:
         vocab_size: Size of the vocabulary.
@@ -35,9 +47,17 @@ class MagGatedConfig(PretrainedConfig):
         tie_word_embeddings: Whether to tie input/output embeddings.
         rope_theta: Base frequency for RoPE.
         use_residual_gate: Whether to use ResidualGate (True) or standard add (False).
-        residual_gate_rank: Low-rank bottleneck dimension for the gate network.
+        residual_gate_n_groups: Number of dimension groups for grouped attention gate.
+            Each group has (hidden_size // n_groups) dimensions. The gate score
+            is computed as a dot product over all dimensions within each group,
+            providing true cross-dimension interaction.
         residual_gate_init_bias: Sigmoid bias for gate initialization.
-            5.0 → sigmoid(5)≈0.993 → initial h_new ≈ h + o (near identity).
+            Controls forget/accept initial values:
+            - b_forget = -init_bias → sigmoid(-init_bias) ≈ 0 (no forgetting)
+            - b_accept = +init_bias → sigmoid(+init_bias) ≈ 1 (full acceptance)
+            - h_new ≈ h + o (near-identity standard residual)
+            - ∂h_new/∂h ≈ 1 (no gradient vanishing at initialization)
+            Recommended: 3.0 (faster gate divergence) or 5.0 (slower, more stable).
         attention_bias: Whether to use bias in attention projections.
         mlp_bias: Whether to use bias in MLP projections.
         attention_dropout: Dropout rate for attention.
@@ -61,10 +81,10 @@ class MagGatedConfig(PretrainedConfig):
         use_cache=True,
         tie_word_embeddings=True,
         rope_theta=1000000.0,
-        # === ResidualGate specific ===
+        # === ResidualGate (Attention Hidden-Size) specific ===
         use_residual_gate=True,
-        residual_gate_rank=16,
-        residual_gate_init_bias=5.0,
+        residual_gate_n_groups=16,
+        residual_gate_init_bias=3.0,
         # === Qwen3-compatible metadata ===
         max_window_layers=28,
         sliding_window=None,
@@ -89,9 +109,9 @@ class MagGatedConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        # ResidualGate
+        # ResidualGate (Attention Hidden-Size)
         self.use_residual_gate = use_residual_gate
-        self.residual_gate_rank = residual_gate_rank
+        self.residual_gate_n_groups = residual_gate_n_groups
         self.residual_gate_init_bias = residual_gate_init_bias
         # Qwen3-compatible metadata
         self.max_window_layers = max_window_layers

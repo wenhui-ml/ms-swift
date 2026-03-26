@@ -1,14 +1,23 @@
 # Copyright (c) 2024. All rights reserved.
 """
-ResidualGate Monitor Callback: Logs gate statistics during training.
+Attention Hidden-Size Residual Gate Monitor Callback: Logs gate statistics during training.
 
-Monitors the dual-gate (α retain, β accept) ResidualGate mechanism:
-    h_new = α(h,o) ⊙ h + β(h,o) ⊙ o
+Monitors the grouped attention-based ResidualGate mechanism (V5):
+    h_new = (1 - forget) ⊙ h + accept ⊙ o
+
+where forget and accept are computed via grouped Q·K attention over the hidden-size dimension.
+
+Key metrics to monitor:
+    retain (1-forget): How much old residual info is preserved per group
+    accept:            How much new sub-layer output is accepted per group
+    forget_active:     Ratio of groups actively forgetting (forget > 0.9)
+    forget_inactive:   Ratio of groups not forgetting (forget < 0.1) — should decrease during training
+    tau (τ):           Temperature controlling gate sharpness
 
 Detects degenerate gate behavior:
-- α,β all → 1 (saturation): Model = standard Transformer, no gating effect
-- α,β all → 0 (collapse): Model dying, information cannot flow
-- Healthy: α,β show variation — selective retention/acceptance per dimension
+- All retain≈1, accept≈1: Gate not yet diverged (normal at start, should change after ~100-500 steps)
+- All retain≈0: Residual info completely discarded — possible gradient issue
+- All accept≈0: New info completely rejected — gate stuck, information bottleneck
 
 Usage:
     from swift.model.mag_gated.gate_monitor_callback import MagGateMonitorCallback
@@ -66,17 +75,17 @@ class MagGateMonitorCallback(TrainerCallback):
         if logs is not None:
             logs.update(numeric_stats)
 
-        # Console summary
-        alpha_mean = gate_stats.get("gate/residual_alpha_global_mean", -1)
-        beta_mean = gate_stats.get("gate/residual_beta_global_mean", -1)
-        sparsity = gate_stats.get("gate/residual_global_sparsity", -1)
-        saturation = gate_stats.get("gate/residual_global_saturation", -1)
-        forget_ratio = gate_stats.get("gate/residual_global_forget_ratio", -1)
+        # Console summary (V5: forget/accept gate semantics)
+        retain_mean = gate_stats.get("gate/residual_alpha_global_mean", -1)  # (1-forget) mean
+        accept_mean = gate_stats.get("gate/residual_beta_global_mean", -1)   # accept mean
+        forget_active = gate_stats.get("gate/residual_global_sparsity", -1)  # groups with forget>0.9
+        forget_inactive = gate_stats.get("gate/residual_global_saturation", -1)  # groups with forget<0.1
+        forget_ratio = gate_stats.get("gate/residual_global_forget_ratio", -1)  # groups with forget>0.5
 
         msg = (
             f"[GateMonitor step={state.global_step}] "
-            f"α_mean={alpha_mean:.4f} | β_mean={beta_mean:.4f} | "
-            f"sparsity={sparsity:.4f} | saturation={saturation:.4f} | "
+            f"retain={retain_mean:.4f} | accept={accept_mean:.4f} | "
+            f"forget_active={forget_active:.4f} | forget_inactive={forget_inactive:.4f} | "
             f"forget_ratio={forget_ratio:.4f}"
         )
         logger.info(msg)
@@ -86,60 +95,68 @@ class MagGateMonitorCallback(TrainerCallback):
             self._log_detailed_breakdown(gate_stats, state.global_step)
 
     def _log_detailed_breakdown(self, gate_stats: dict, step: int):
-        """Log detailed per-layer ResidualGate statistics."""
+        """Log detailed per-layer ResidualGate statistics (V5 grouped attention gate)."""
         lines = [f"\n{'='*80}"]
-        lines.append(f"[GateMonitor step={step}] Detailed Per-Layer Gate Breakdown")
+        lines.append(f"[GateMonitor step={step}] V5 Grouped Attention Gate Breakdown")
+        lines.append(f"  h_new = (1-forget)⊙h + accept⊙o")
         lines.append(f"{'='*80}")
 
-        # Parse per-layer stats
-        layer_data = {}
+        # Parse per-layer stats into structured data
+        layer_gates = {}  # {layer_idx: {gate_name: {stat_name: value}}}
         for key, value in gate_stats.items():
             if not isinstance(value, (int, float)):
                 continue
-            if key.startswith("gate/layer") and "global" not in key:
-                parts = key.replace("gate/layer", "").split("_", 1)
-                if len(parts) == 2:
-                    try:
-                        layer_idx = int(parts[0])
-                    except ValueError:
-                        continue
-                    rest = parts[1]
-                    if layer_idx not in layer_data:
-                        layer_data[layer_idx] = {}
-                    layer_data[layer_idx][rest] = value
+            if not key.startswith("gate/layer"):
+                continue
+            if "global" in key:
+                continue
+            # key format: gate/layer{idx}_{gate_name}_{stat} or gate/layer{idx}_{gate_name}_beta_{stat}
+            rest = key.replace("gate/layer", "")
+            parts = rest.split("_", 1)
+            if len(parts) < 2:
+                continue
+            try:
+                layer_idx = int(parts[0])
+            except ValueError:
+                continue
+            remainder = parts[1]
+            if layer_idx not in layer_gates:
+                layer_gates[layer_idx] = {}
+            layer_gates[layer_idx][remainder] = value
 
-        # Print table
-        lines.append(f"\n   {'Layer':>5} | {'Proj':>12} | {'Mean':>7} | {'Std':>7} | {'Min':>7} | {'Max':>7} | {'Sparse':>7} | {'Satur':>7}")
-        lines.append(f"  {'-'*6}-+-{'-'*12}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}")
+        # Print compact table: one row per layer, showing attn and ffn gates
+        lines.append(f"\n  {'Layer':>5} | {'Gate':>8} | {'Retain':>7} | {'Accept':>7} | {'Forget%':>8} | {'τ':>6}")
+        lines.append(f"  {'-'*5}-+-{'-'*8}-+-{'-'*7}-+-{'-'*7}-+-{'-'*8}-+-{'-'*6}")
 
-        for layer_idx in sorted(layer_data.keys()):
-            data = layer_data[layer_idx]
-            projs = {}
-            for key, val in data.items():
-                parts = key.rsplit("_", 1)
-                if len(parts) == 2:
-                    proj_name, stat_name = parts
-                    if proj_name not in projs:
-                        projs[proj_name] = {}
-                    projs[proj_name][stat_name] = val
-
-            for proj_name in sorted(projs.keys()):
-                p = projs[proj_name]
+        for layer_idx in sorted(layer_gates.keys()):
+            data = layer_gates[layer_idx]
+            for gate_type in ["attn", "ffn"]:
+                prefix = f"{gate_type}_residual_gate"
+                retain = data.get(f"{prefix}_mean", -1)
+                accept = data.get(f"{prefix}_beta_mean", -1)
+                forget_r = data.get(f"{prefix}_forget_ratio", -1)
+                # Get temperature from gate stats if available
+                tau_key = f"gate/layer{layer_idx}_{prefix}_tau"
+                tau = gate_stats.get(tau_key, -1)
                 lines.append(
-                    f"  {layer_idx:>6} | {proj_name:>12} | {p.get('mean', -1):>7.4f} | "
-                    f"{p.get('std', -1):>7.4f} | {p.get('min', -1):>7.4f} | "
-                    f"{p.get('max', -1):>7.4f} | {p.get('sparsity', -1):>7.4f} | "
-                    f"{p.get('saturation', -1):>7.4f}"
+                    f"  {layer_idx:>5} | {gate_type:>8} | {retain:>7.4f} | {accept:>7.4f} | "
+                    f"{forget_r*100:>7.2f}% | {tau:>6.3f}" if isinstance(tau, float) and tau > 0
+                    else f"  {layer_idx:>5} | {gate_type:>8} | {retain:>7.4f} | {accept:>7.4f} | "
+                    f"{forget_r*100:>7.2f}% |    -"
                 )
 
-        # Summary
-        lines.append(f"\n  Summary:")
-        for key in ["gate/residual_alpha_global_mean", "gate/residual_beta_global_mean",
-                     "gate/residual_global_sparsity", "gate/residual_global_saturation",
-                     "gate/residual_global_forget_ratio"]:
-            if key in gate_stats and isinstance(gate_stats[key], (int, float)):
-                short_key = key.replace("gate/", "")
-                lines.append(f"    {short_key:>35}: {gate_stats[key]:.6f}")
+        # Global summary
+        lines.append(f"\n  Global Summary:")
+        retain_g = gate_stats.get("gate/residual_alpha_global_mean", -1)
+        accept_g = gate_stats.get("gate/residual_beta_global_mean", -1)
+        forget_active_g = gate_stats.get("gate/residual_global_sparsity", -1)
+        forget_inactive_g = gate_stats.get("gate/residual_global_saturation", -1)
+        forget_ratio_g = gate_stats.get("gate/residual_global_forget_ratio", -1)
+        lines.append(f"    retain (1-forget) mean:  {retain_g:.6f}")
+        lines.append(f"    accept mean:             {accept_g:.6f}")
+        lines.append(f"    groups actively forgetting (>0.9): {forget_active_g:.4f}")
+        lines.append(f"    groups not forgetting (<0.1):      {forget_inactive_g:.4f}")
+        lines.append(f"    groups with forget>0.5:            {forget_ratio_g:.4f}")
 
         lines.append(f"{'='*80}")
         logger.info("\n".join(lines))

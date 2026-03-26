@@ -1,5 +1,5 @@
 # Copyright (c) 2024. All rights reserved.
-# ResidualGate Transformer
+# Attention Hidden-Size Residual Gate Transformer (AttnResGate)
 from .configuration_mag_gated import MagGatedConfig
 from .modeling_mag_gated import (
     MagGatedForCausalLM,

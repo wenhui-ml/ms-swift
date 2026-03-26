@@ -1,15 +1,18 @@
 
 #!/bin/bash
 # ============================================================================
-# MagGated Transformer 从头预训练脚本
+# Attention Hidden-Size Residual Gate Transformer 从头预训练脚本
+#
+# 使用分组 attention 机制（Q·K/√d_k）在 hidden-size 维度上计算
+# 选择性 forget/accept gate，替代标准残差连接 h = h + o。
 # 
 # 关键：必须设置 NPROC_PER_NODE=GPU数量 来启动多卡 DDP 训练！
 #   不设的话 swift 只启动单进程，4卡会触发 device_map='auto'（模型并行）
 #   与 deepspeed 冲突会报错。
 #
 # Usage:
-#   bash configs/pt_mag_gated.sh model_checkpoints/mag_gated-d512-L28 1000 4
-#   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L12 1000 4
+#   bash configs/pt_mag_gated.sh model_checkpoints/mag_gated-d1024-L28 3500 8
+#   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L28 3500 8
 # ============================================================================
 
 MODEL_DIR=${1:-model_checkpoints/mag_gated-d1024-L28}

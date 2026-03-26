@@ -1,16 +1,19 @@
 #!/usr/bin/env python
-"""Analyze ResidualGate Transformer gate activations and dimension utilization.
+"""Analyze Attention Hidden-Size Residual Gate activations and dimension utilization.
 
-This script loads a trained MagGated model and analyzes:
-1. Per-layer ResidualGate activation statistics (α retain, β accept)
-2. Dimension utilization rates (how many dims are actually used)
+This script loads a trained AttnResGate model and analyzes:
+1. Per-layer ResidualGate statistics (retain=1-forget, accept gates per group)
+2. Group-level gate utilization (how many groups actively forget/accept)
 3. Visualizations of gate activations (heatmaps and histograms)
 
-The ResidualGate mechanism:
-    h_new = α(h,o) ⊙ h + β(h,o) ⊙ o
+The ResidualGate (V5) mechanism:
+    h_new = (1 - forget) ⊙ h + accept ⊙ o
 
-where α and β are independently computed per-dimension gates informed by
-magnitude/direction signals.
+where forget and accept are per-group gates computed via grouped Q·K attention:
+    score_h = (w_q * key_h).sum(group_dim) / (τ·√group_size)
+    score_o = (w_q * key_o).sum(group_dim) / (τ·√group_size)
+    forget  = sigmoid(score_h + b_forget)  ← initially ≈ 0
+    accept  = sigmoid(score_o + b_accept)  ← initially ≈ 1
 
 Usage:
     python configs/analyze_gates.py --model_dir output/mag_gated-d1024-L28/checkpoint-5000 --plot_dir plots/
@@ -78,25 +81,32 @@ def analyze_gate_activations(model, tokenizer, texts, device='cuda'):
 
     print(f"Found {len(residual_gates)} ResidualGate modules.")
 
-    # Hook ResidualGate to capture α and β
+    # Hook ResidualGate to capture forget and accept gates
     for name, module in residual_gates.items():
         def make_res_hook(n):
             def hook_fn(m, input, output):
                 with torch.no_grad():
                     residual, new_output = input[0], input[1]
-                    # Recompute alpha/beta exactly as in ResidualGate.forward()
-                    eps = 1e-6
-                    h_mag = residual.detach().abs()
-                    o_mag = new_output.detach().abs()
-                    mag_ratio = h_mag / (h_mag + o_mag + eps)
-                    dir_agree = (residual.detach() * new_output.detach()) / (h_mag * o_mag + eps)
-                    gate_input = torch.cat([residual, new_output, mag_ratio, dir_agree], dim=-1)
-                    gate_hidden = m.gate_A(gate_input)
-                    alpha = torch.sigmoid(m.gate_B_alpha(gate_hidden))
-                    beta = torch.sigmoid(m.gate_B_beta(gate_hidden))
+                    # Recompute forget/accept as in V5 ResidualGate.forward()
+                    orig_shape = residual.shape
+                    tau = m.log_tau.exp()
+                    scale = m._scale / (tau + 1e-8)
+                    key_h = (m.w_kh * residual).view(*orig_shape[:-1], m.n_groups, m.group_size)
+                    key_o = (m.w_ko * new_output).view(*orig_shape[:-1], m.n_groups, m.group_size)
+                    score_h = (m.w_q * key_h).sum(dim=-1) * scale
+                    score_o = (m.w_q * key_o).sum(dim=-1) * scale
+                    forget = torch.sigmoid(score_h + m.b_forget)
+                    accept = torch.sigmoid(score_o + m.b_accept)
+                    # Expand to per-dim for analysis
+                    retain = (1.0 - forget).unsqueeze(-1).expand(
+                        *orig_shape[:-1], m.n_groups, m.group_size
+                    ).reshape(orig_shape)
+                    accept_d = accept.unsqueeze(-1).expand(
+                        *orig_shape[:-1], m.n_groups, m.group_size
+                    ).reshape(orig_shape)
 
-                    res_alpha_activations[n].append(alpha.cpu().float())
-                    res_beta_activations[n].append(beta.cpu().float())
+                    res_alpha_activations[n].append(retain.cpu().float())
+                    res_beta_activations[n].append(accept_d.cpu().float())
             return hook_fn
         hooks.append(module.register_forward_hook(make_res_hook(name)))
 
@@ -219,8 +229,10 @@ def main():
 
     # Print summary table
     print("\n" + "=" * 80)
-    print("ResidualGate Analysis: α (retain gate) and β (accept gate)")
-    print("  h_new = α ⊙ h + β ⊙ o")
+    print("Attention Hidden-Size ResidualGate Analysis (V5)")
+    print("  h_new = (1-forget) ⊙ h + accept ⊙ o")
+    print("  retain = 1 - forget (higher = more old info preserved)")
+    print("  accept (higher = more new info accepted)")
     print("=" * 80)
 
     if stats_alpha:
