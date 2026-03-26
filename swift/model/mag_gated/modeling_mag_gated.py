@@ -174,8 +174,9 @@ class ResidualGate(nn.Module):
         # Q·K / (τ·√group_size): grouped dot product with scaling
         # w_q: (n_groups, group_size), key_*_g: (*, n_groups, group_size)
         # Result: (*, n_groups) — one score per group
-        tau = self.log_tau.float().exp()
-        scale = self._scale / (tau + 1e-8)  # combined scaling, both float32
+        # Compute scale in input dtype to avoid float32 contamination in mixed-precision
+        tau = self.log_tau.exp()
+        scale = (self._scale.to(dtype=key_h_g.dtype) / (tau + 1e-8))
 
         score_h = (self.w_q * key_h_g).sum(dim=-1) * scale  # (*, n_groups)
         score_o = (self.w_q * key_o_g).sum(dim=-1) * scale  # (*, n_groups)
@@ -946,7 +947,7 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
             result["query_maxabs"] = avg_q_max
             result["accept_bias_mean"] = avg_accept
             result["query_ok"] = avg_q_max < 0.05
-            result["accept_ok"] = avg_accept > 3.0  # should be near init_bias (5.0)
+            result["accept_ok"] = avg_accept >= 2.5  # should be near init_bias (default 3.0 or 5.0)
             result["all_ok"] = result["query_ok"] and result["accept_ok"]
         else:
             result["all_ok"] = True

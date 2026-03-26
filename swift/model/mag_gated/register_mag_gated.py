@@ -113,7 +113,7 @@ def auto_inject_gate_monitor():
         _original_train = Trainer.train
 
         def _patched_train(self, *args, **kwargs):
-            inject_gate_monitor_callback(self, log_every_n_steps=20, detail_every_n_steps=20)
+            inject_gate_monitor_callback(self, log_every_n_steps=50, detail_every_n_steps=50)
             return _original_train(self, *args, **kwargs)
 
         Trainer.train = _patched_train

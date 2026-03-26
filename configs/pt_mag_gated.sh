@@ -15,7 +15,7 @@
 #   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L28 3500 8
 # ============================================================================
 
-MODEL_DIR=${1:-model_checkpoints/mag_gated-d1024-L28}
+MODEL_DIR=${1:-model_checkpoints/attn_res_gate-d1024-L28}
 MAX_STEPS=${2:-3500}
 nproc_per_node=${3:-8}
 
