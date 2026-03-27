@@ -15,8 +15,8 @@
 #   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L28 3500 8
 # ============================================================================
 
-MODEL_DIR=${1:-model_checkpoints/attn_res_gate-d1024-L28}
-MAX_STEPS=${2:-3500}
+MODEL_DIR=${1:-model_checkpoints/attn_res_gate-d1024-L28-v5.2}
+MAX_STEPS=${2:-150}
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
@@ -37,13 +37,13 @@ swift pt \
     --template qwen3 \
     --tuner_type full \
     --dataset \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_khan.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_math.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_stanford.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/fineweb_1000k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/magpie_10k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/skypile_600k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/starcoder_py.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_khan.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_math.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/cosmo_stanford.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/fineweb_100k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/magpie_10k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/skypile_60k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets/starcoder_py.jsonl \
     --streaming false \
     --torch_dtype bfloat16 \
     --per_device_train_batch_size 2 \
@@ -61,8 +61,8 @@ swift pt \
     --weight_decay 0.1 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
-    --dataloader_num_workers 16 \
-    --dataset_num_proc 16 \
+    --dataloader_num_workers 64 \
+    --dataset_num_proc 64 \
     --save_only_model true \
     --output_dir output/$MODEL_NAME \
     --lr_scheduler_type cosine \

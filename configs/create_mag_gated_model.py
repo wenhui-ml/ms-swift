@@ -175,7 +175,7 @@ def main():
     parser.add_argument('--num_key_value_heads', type=int, default=None)
     parser.add_argument('--head_dim', type=int, default=128)
     parser.add_argument('--residual_gate_n_groups', type=int, default=16)
-    parser.add_argument('--residual_gate_init_bias', type=float, default=3.0)
+    parser.add_argument('--residual_gate_init_bias', type=float, default=0.0)
     parser.add_argument('--max_position_embeddings', type=int, default=40960)
     parser.add_argument('--vocab_size', type=int, default=151936)
     parser.add_argument('--tie_word_embeddings', action='store_true', default=True)

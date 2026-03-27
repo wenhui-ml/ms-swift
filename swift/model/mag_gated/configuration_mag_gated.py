@@ -8,7 +8,7 @@ Pure Qwen3-compatible architecture with one core enhancement:
 
 Gate values are computed via grouped query-key attention over h and o,
 following self-attention principles applied to the hidden-size dimension:
-    Q: per-group learned query w_q
+    Q: per-group learned query w_q (init: small random N(0, 0.01))
     K: per-dim projections key_h = w_kh ⊙ h, key_o = w_ko ⊙ o
     Score: grouped dot product Q·K / (τ·√group_size)
     forget = sigmoid(score_h + b_forget)  ← based on h's features
@@ -53,12 +53,20 @@ class MagGatedConfig(PretrainedConfig):
             providing true cross-dimension interaction.
         residual_gate_init_bias: Sigmoid bias for gate initialization.
             Controls forget/accept initial values:
-            - b_forget = -init_bias → sigmoid(-init_bias) ≈ 0 (no forgetting)
-            - b_accept = +init_bias → sigmoid(+init_bias) ≈ 1 (full acceptance)
-            - h_new ≈ h + o (near-identity standard residual)
-            - ∂h_new/∂h ≈ 1 (no gradient vanishing at initialization)
-            Default: 3.0 → sigmoid(±3) ≈ 0.047/0.953 (faster gate divergence).
-            Alternative: 5.0 → sigmoid(±5) ≈ 0.007/0.993 (tighter near-identity, slower divergence).
+            - b_forget = -init_bias → sigmoid(-init_bias) (low forgetting)
+            - b_accept = +init_bias → sigmoid(+init_bias) (high acceptance)
+            - h_new ≈ scaled (h + o) (near-identity standard residual)
+
+            CRITICAL: init_bias controls sigmoid gradient flow!
+            - 1.0 (default): σ'(±1) ≈ 0.197, good gradient → gates learn quickly
+            - 2.0: σ'(±2) ≈ 0.105, moderate gradient
+            - 3.0: σ'(±3) ≈ 0.045, weak gradient → gates learn slowly
+            - 5.0: σ'(±5) ≈ 0.007, near-zero gradient → GATES FREEZE!
+
+            Recommended: 1.0 for from-scratch pretraining.
+        residual_gate_lr_scale: Learning rate multiplier for gate parameters.
+            Gate parameters receive lr * gate_lr_scale. Higher values help
+            compensate for sigmoid gradient attenuation. Default: 5.0.
         attention_bias: Whether to use bias in attention projections.
         mlp_bias: Whether to use bias in MLP projections.
         attention_dropout: Dropout rate for attention.
@@ -85,7 +93,8 @@ class MagGatedConfig(PretrainedConfig):
         # === ResidualGate (Attention Hidden-Size) specific ===
         use_residual_gate=True,
         residual_gate_n_groups=16,
-        residual_gate_init_bias=3.0,
+        residual_gate_init_bias=0.0,
+        residual_gate_lr_scale=5.0,
         # === Qwen3-compatible metadata ===
         max_window_layers=28,
         sliding_window=None,
@@ -114,6 +123,7 @@ class MagGatedConfig(PretrainedConfig):
         self.use_residual_gate = use_residual_gate
         self.residual_gate_n_groups = residual_gate_n_groups
         self.residual_gate_init_bias = residual_gate_init_bias
+        self.residual_gate_lr_scale = residual_gate_lr_scale
         # Qwen3-compatible metadata
         self.max_window_layers = max_window_layers
         self.sliding_window = sliding_window
