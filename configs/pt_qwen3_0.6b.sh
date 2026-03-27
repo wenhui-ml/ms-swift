@@ -1,5 +1,5 @@
 MODEL_DIR=${1:-model_checkpoints/Qwen3-0.6B-standard}
-MAX_STEPS=${2:-3500}   
+MAX_STEPS=${2:-300}   
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
@@ -20,13 +20,15 @@ swift pt \
     --template qwen3 \
     --tuner_type full \
     --dataset \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_khan.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_math.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/cosmo_stanford.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/fineweb_1000k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/magpie_10k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/skypile_600k.jsonl \
-        /home/ubuntu/wenhui/mag_gate/local_datasets_2.6m/starcoder_py.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/cosmo_khan.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/cosmo_math.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/cosmo_stanford.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/fineweb_100k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/magpie_10k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/skypile_60k.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/starcoder_py.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/gsm8k_full.jsonl \
+        /home/ubuntu/wenhui/mag_gate/local_datasets_280k/mmlu_full.jsonl \
     --streaming false \
     --torch_dtype bfloat16 \
     --per_device_train_batch_size 2 \

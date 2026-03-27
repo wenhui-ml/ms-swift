@@ -731,36 +731,10 @@ class MagGatedForCausalLM(MagGatedPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        **kwargs,
-    ):
-        if past_key_values is not None:
-            if input_ids.shape[1] != 1:
-                input_ids = input_ids[:, -1:]
-
-        if cache_position is None:
-            past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_length, past_length + input_ids.shape[1], device=input_ids.device
-            )
-
-        position_ids = cache_position.unsqueeze(0)
-
-        model_inputs = {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache", True),
-            "attention_mask": attention_mask,
-        }
-        return model_inputs
+    # NOTE: prepare_inputs_for_generation is NOT overridden here.
+    # We rely on GenerationMixin's default implementation (transformers >= 4.45),
+    # which correctly handles KV cache slicing, SDPA attention masks, and
+    # cache_position tracking during autoregressive generation.
 
     # ==================================================================
     # Gate Monitoring API
