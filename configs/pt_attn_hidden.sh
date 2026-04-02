@@ -1,28 +1,38 @@
-
 #!/bin/bash
 # ============================================================================
-# Attention Hidden-Size Residual Gate Transformer 从头预训练脚本
+# Attention Hidden-Size Transformer V11 预训练脚本
 #
-# 使用分组 attention 机制（Q·K/√d_k）在 hidden-size 维度上计算
-# 选择性 forget/accept gate，替代标准残差连接 h = h + o。
-# 
+# 使用完整 Self-Attention 机制在 hidden-size 维度上计算
+# 内容依赖的 retain/accept gate，替代标准残差连接 h = h + o。
+#
+# V11 核心设计：
+#   Q = W_q · rms_norm(h)    — 内容依赖的 query
+#   K_h = W_kh · rms_norm(h) — h 的 key
+#   K_o = W_ko · rms_norm(o) — o 的 key
+#   [α, β] = softmax(Q·K)    — 竞争选择
+#   h_new = α⊙h + β⊙o       — 门控残差
+#   + 跨层 gate_context 传递
+#
 # 关键：必须设置 NPROC_PER_NODE=GPU数量 来启动多卡 DDP 训练！
-#   不设的话 swift 只启动单进程，4卡会触发 device_map='auto'（模型并行）
-#   与 deepspeed 冲突会报错。
 #
 # Usage:
-#   bash configs/pt_mag_gated.sh model_checkpoints/mag_gated-d1024-L28 3500 8
-#   bash configs/pt_mag_gated.sh model_checkpoints/baseline-d1024-L28 3500 8
+#   # 创建模型权重（首次运行前执行）
+#   python configs/create_attn_hidden_model.py \
+#       --tokenizer_from model_checkpoints/Qwen3-0.6B-standard \
+#       --output_dir model_checkpoints/attn_hidden-d1024-L28-v11
+#
+#   # 训练
+#   bash configs/pt_attn_hidden.sh model_checkpoints/attn_hidden-d1024-L28-v11 3500 8
 # ============================================================================
 
-MODEL_DIR=${1:-model_checkpoints/attn_res_gate-d1024-L28-v5.2}
-MAX_STEPS=${2:-150}
+MODEL_DIR=${1:-model_checkpoints/attn_hidden-d1024-L28-v11}
+MAX_STEPS=${2:-3500}
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
 
 echo "============================================"
-echo "MagGated Pretraining: $MODEL_NAME"
+echo "Attention Hidden-Size V11 Pretraining"
 echo "  Model: $MODEL_DIR"
 echo "  Max Steps: $MAX_STEPS"
 echo "  GPUs: $nproc_per_node"
@@ -33,7 +43,7 @@ NPROC_PER_NODE=$nproc_per_node \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift pt \
     --model $MODEL_DIR \
-    --model_type qwen3 \
+    --model_type attn_hidden \
     --template qwen3 \
     --tuner_type full \
     --dataset \
@@ -71,4 +81,3 @@ swift pt \
     --train_dataloader_shuffle true \
     --attn_impl flash_attention_3 \
     --packing true
-

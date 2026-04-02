@@ -2,7 +2,7 @@
 from transformers.utils import is_torch_npu_available
 
 from . import models
-from .mag_gated.register_mag_gated import register_mag_gated  # Register MagGated Transformer
+from .attention_hidden_size.register_attn_hidden import register_attn_hidden  # Register Attention Hidden-Size Transformer
 from .constant import LLMModelType, MLLMModelType, ModelType
 from .model_arch import MODEL_ARCH_MAPPING, ModelArch, ModelKeys, MultiModelKeys, get_model_arch, register_model_arch
 from .model_meta import Model, ModelGroup, ModelInfo, ModelMeta, get_matched_model_meta, get_model_name
