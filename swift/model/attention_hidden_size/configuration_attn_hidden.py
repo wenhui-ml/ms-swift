@@ -55,6 +55,14 @@ class AttnHiddenConfig(PretrainedConfig):
         residual_gate_context_dim: Dimension of cross-layer gate context.
             Set to 0 to disable cross-layer information.
         residual_gate_lr_scale: Learning rate multiplier for gate parameters.
+        residual_gate_init_mode: Initialization mode for gate projections.
+            - "sft": LoRA-style init (K=zeros). Initial h_new = h + o exactly.
+              Use when transferring weights from a pretrained Qwen3 model.
+            - "pretrain": All projections small random. Small initial perturbation.
+              Use when training from scratch.
+        residual_gate_init_remove_scale: Initial value of the learnable removal
+            scale factor. Controls max removal per layer. Default 0.1 means
+            each layer can remove at most ~10% of h or o initially.
         attention_bias: Whether to use bias in attention projections.
         mlp_bias: Whether to use bias in MLP projections.
         attention_dropout: Dropout rate for attention.
@@ -83,6 +91,8 @@ class AttnHiddenConfig(PretrainedConfig):
         residual_gate_num_heads=8,
         residual_gate_context_dim=16,
         residual_gate_lr_scale=5.0,
+        residual_gate_init_mode="sft",
+        residual_gate_init_remove_scale=0.1,
         # === Qwen3-compatible metadata ===
         max_window_layers=28,
         sliding_window=None,
@@ -112,6 +122,8 @@ class AttnHiddenConfig(PretrainedConfig):
         self.residual_gate_num_heads = residual_gate_num_heads
         self.residual_gate_context_dim = residual_gate_context_dim
         self.residual_gate_lr_scale = residual_gate_lr_scale
+        self.residual_gate_init_mode = residual_gate_init_mode
+        self.residual_gate_init_remove_scale = residual_gate_init_remove_scale
         # Qwen3-compatible metadata
         self.max_window_layers = max_window_layers
         self.sliding_window = sliding_window

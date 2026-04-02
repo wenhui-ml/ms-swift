@@ -89,48 +89,50 @@ logger = logging.get_logger(__name__)
 # ==============================================================================
 
 class ResidualGate(nn.Module):
-    """Full Self-Attention Residual Gate over the hidden-size dimension.
+    """Subtractive Self-Attention Residual Gate over the hidden-size dimension.
 
-    Computes content-dependent gate weights via self-attention:
-        Q = W_q · rms_norm(h)         — h asks "what do I need?"
-        K_h = W_kh · rms_norm(h)      — h answers "what does h provide?"
-        K_o = W_ko · rms_norm(o)      — o answers "what does o provide?"
-        (rms_norm is pure normalization without learnable γ weight)
-        score_h = Q · K_h per head    — semantic match for retaining h
-        score_o = Q · K_o per head    — semantic match for accepting o
-        [α, β] = softmax([score_h, score_o])  — competitive selection
+    Core formula:
+        h_new = h + o - scale · (tanh(score_h) ⊙ h + tanh(score_o) ⊙ o)
 
-    Output:
-        h_new = α ⊙ h + β ⊙ o
+    where scores are computed via full self-attention:
+        Q = W_q · rms_norm(h)         — content-dependent query
+        K_h = W_kh · rms_norm(h)      — h's key (what h provides)
+        K_o = W_ko · rms_norm(o)      — o's key (what o provides)
+        score_h = Q · K_h per head    — how much of h to remove
+        score_o = Q · K_o per head    — how much of o to remove
 
-    Cross-layer information:
-        Receives gate_context from previous layer, uses it to modulate scores.
-        Outputs updated gate_context for next layer.
+    Two initialization modes:
+        - "sft" (default): LoRA-style init. K projections initialized to ZERO.
+          Initial scores = 0 → tanh(0) = 0 → h_new = h + o (exact standard residual).
+          Perfect for weight transfer from Qwen3 — zero training disruption.
+
+        - "pretrain": Q and K initialized with small random values (std=0.02).
+          Initial scores ≈ small random → tanh(ε) ≈ ε → h_new ≈ h + o - ε·(h+o).
+          Small initial perturbation from standard residual.
 
     Key properties:
-        1. Q is content-dependent: different tokens produce different queries
-        2. K is content-dependent: different h/o content produces different keys
-        3. Global view: W_q, W_k are Linear(d, H), seeing entire hidden vector
-        4. Multi-head: each head produces one scalar score, controls d/H dimensions
-        5. Cross-layer: gate_context enables depth-wise coordination
-        6. No hand-crafted features: pure learned self-attention
+        1. Initial h_new = h + o (exact, no training disruption for SFT)
+        2. Can remove redundant info from h: tanh(score_h) > 0 → subtract from h
+        3. Can remove harmful info from o: tanh(score_o) > 0 → subtract from o
+        4. Can amplify useful info: tanh(score) < 0 → add instead of subtract
+        5. Gradient direct-through: ∂h_new/∂h = I - scale·tanh'·... ≈ I
+        6. Bounded removal: tanh ∈ (-1,1), scale controls max removal per layer
+        7. Content-dependent: Q, K are functions of h and o
+        8. Cross-layer: gate_context enables depth-wise coordination
 
-    Initialization:
-        All projection weights initialized to small random values (std=0.02).
-        Initial scores ≈ small random → softmax([ε₁, ε₂]) ≈ [0.5, 0.5]
-        → h_new ≈ 0.5·h + 0.5·o (equal mixing, good gradient flow)
-
-    Parameters per gate: 3×(d×H) + H×C + 2H×C + d ≈ 3dH + 3HC
+    Parameters per gate: 3×(d×H) + 1 + H×C + 2H×C ≈ 3dH + 3HC
         With d=1024, H=8, C=16: ~25K per gate
     """
 
     def __init__(self, hidden_size: int, num_heads: int = 8,
-                 context_dim: int = 16, eps: float = 1e-6):
+                 context_dim: int = 16, init_mode: str = "sft",
+                 init_remove_scale: float = 0.1, eps: float = 1e-6):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.context_dim = context_dim
+        self.init_mode = init_mode
         self.eps = eps
 
         if hidden_size % num_heads != 0:
@@ -139,37 +141,44 @@ class ResidualGate(nn.Module):
             )
 
         # === Self-Attention Projections (content-dependent) ===
-        # Q from h: "what do I need?" — Linear(d, H), each head gets 1 scalar
         self.q_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        # K from h: "what does h provide?"
         self.k_h_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        # K from o: "what does o provide?"
         self.k_o_proj = nn.Linear(hidden_size, num_heads, bias=False)
+
+        # === Learnable removal scale (controls max removal per layer) ===
+        # Initialized small to prevent aggressive removal early in training
+        self.log_remove_scale = nn.Parameter(
+            torch.tensor(math.log(init_remove_scale))
+        )
 
         # === Cross-Layer Context ===
         if context_dim > 0:
-            # Receive context from previous layer
             self.context_to_score = nn.Linear(context_dim, num_heads, bias=False)
-            # Output context for next layer
             self.score_to_context = nn.Linear(num_heads * 2, context_dim, bias=False)
         else:
             self.context_to_score = None
             self.score_to_context = None
 
-        # === Pure RMS normalization (no learnable weight γ) ===
-        # Avoids γ's fixed magnitude pattern biasing gate decisions.
-        # Inline for efficiency — no nn.Module overhead, torch.compile friendly.
-        # eps stored as Python float to avoid buffer overhead.
-
         # === Initialization ===
-        # Small random init for projections — initial scores ≈ small random
-        # softmax([ε₁, ε₂]) ≈ [0.5, 0.5] → h_new ≈ 0.5(h + o)
-        nn.init.normal_(self.q_proj.weight, std=0.02)
-        nn.init.normal_(self.k_h_proj.weight, std=0.02)
-        nn.init.normal_(self.k_o_proj.weight, std=0.02)
+        if init_mode == "sft":
+            # LoRA-style: Q random, K zeros → score = Q * 0 = 0 → h_new = h + o
+            nn.init.normal_(self.q_proj.weight, std=0.02)
+            nn.init.zeros_(self.k_h_proj.weight)
+            nn.init.zeros_(self.k_o_proj.weight)
+        else:  # "pretrain"
+            # All small random → small initial perturbation
+            nn.init.normal_(self.q_proj.weight, std=0.02)
+            nn.init.normal_(self.k_h_proj.weight, std=0.02)
+            nn.init.normal_(self.k_o_proj.weight, std=0.02)
+
         if self.context_to_score is not None:
             nn.init.zeros_(self.context_to_score.weight)
             nn.init.zeros_(self.score_to_context.weight)
+
+        # Mark all child modules to skip _init_weights
+        for child in self.modules():
+            if child is not self:
+                child._skip_init = True
 
         # Gate monitoring
         self._gate_raw: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -183,60 +192,66 @@ class ResidualGate(nn.Module):
             new_output: (*, d) - output from attention/FFN sub-layer (o)
             gate_context: (*, context_dim) - cross-layer context from previous gate
         Returns:
-            h_new: (*, d) - α⊙h + β⊙o
+            h_new: (*, d) - h + o - scale·(tanh(score_h)⊙h + tanh(score_o)⊙o)
             new_context: (*, context_dim) - updated context for next gate
         """
-        # Pure RMS normalization (no learnable γ weight)
-        # Stays in input dtype for speed; single fused rsqrt op
+        orig_shape = residual.shape
+
+        # Pure RMS normalization (no learnable γ, stays in input dtype)
         h_norm = residual * torch.rsqrt(residual.pow(2).mean(-1, keepdim=True) + self.eps)
         o_norm = new_output * torch.rsqrt(new_output.pow(2).mean(-1, keepdim=True) + self.eps)
 
         # Q from h (content-dependent query)
-        q = self.q_proj(h_norm)          # (*, num_heads)
+        q = self.q_proj(h_norm)          # (*, H)
 
         # K from h and o (content-dependent keys)
-        k_h = self.k_h_proj(h_norm)      # (*, num_heads)
-        k_o = self.k_o_proj(o_norm)      # (*, num_heads)
+        k_h = self.k_h_proj(h_norm)      # (*, H)
+        k_o = self.k_o_proj(o_norm)      # (*, H)
 
-        # Attention scores: Q · K (element-wise, each head produces 1 scalar)
-        score_h = q * k_h                # (*, num_heads)
-        score_o = q * k_o                # (*, num_heads)
+        # Attention scores: Q · K (element-wise, each head → 1 scalar)
+        score_h = q * k_h                # (*, H)
+        score_o = q * k_o                # (*, H)
 
         # Cross-layer modulation
         if gate_context is not None and self.context_to_score is not None:
-            context_mod = self.context_to_score(gate_context)  # (*, num_heads)
+            context_mod = self.context_to_score(gate_context)  # (*, H)
             score_h = score_h + context_mod
-            score_o = score_o - context_mod  # complementary modulation
+            score_o = score_o + context_mod
 
-        # Softmax over [h, o] — competitive selection per head
-        scores = torch.stack([score_h, score_o], dim=-1)  # (*, num_heads, 2)
-        weights = F.softmax(scores.float(), dim=-1).to(residual.dtype)
-        alpha = weights[..., 0]  # (*, num_heads)
-        beta = weights[..., 1]   # (*, num_heads)
+        # Removal weights: tanh bounds to (-1, 1)
+        # > 0: remove this component (filter redundant/harmful)
+        # < 0: amplify this component (strengthen useful info)
+        # = 0: no change (standard residual)
+        remove_h = torch.tanh(score_h)   # (*, H)
+        remove_o = torch.tanh(score_o)   # (*, H)
 
-        # Expand to dimension level: each head controls head_dim dimensions
-        orig_shape = residual.shape
+        # Learnable removal scale (prevents aggressive removal)
+        scale = self.log_remove_scale.exp()  # scalar, init = 0.1
+
+        # Reshape to head groups for per-head gating
         residual_g = residual.view(*orig_shape[:-1], self.num_heads, self.head_dim)
         output_g = new_output.view(*orig_shape[:-1], self.num_heads, self.head_dim)
 
-        result = (
-            alpha.unsqueeze(-1) * residual_g +
-            beta.unsqueeze(-1) * output_g
-        ).view(orig_shape)
+        # Subtractive gate: h + o - scale·(remove_h⊙h + remove_o⊙o)
+        removal = scale * (
+            remove_h.unsqueeze(-1) * residual_g +
+            remove_o.unsqueeze(-1) * output_g
+        )
+        result = (residual_g + output_g - removal).view(orig_shape)
 
         # Update cross-layer context
         new_context = None
         if self.score_to_context is not None:
-            gate_stats = torch.cat([alpha, beta], dim=-1)  # (*, num_heads * 2)
-            context_update = self.score_to_context(gate_stats.detach())  # (*, context_dim)
+            gate_stats = torch.cat([remove_h, remove_o], dim=-1)  # (*, H*2)
+            context_update = self.score_to_context(gate_stats.detach())
             if gate_context is not None:
-                new_context = gate_context + context_update  # residual update
+                new_context = gate_context + context_update
             else:
                 new_context = context_update
 
         # Save gate for monitoring
         if self.training:
-            self._gate_raw = (alpha.detach(), beta.detach())
+            self._gate_raw = (remove_h.detach(), remove_o.detach(), scale.detach())
 
         return result, new_context
 
@@ -245,21 +260,22 @@ class ResidualGate(nn.Module):
         """Compute gate statistics from raw tensors."""
         if self._gate_raw is None:
             return None
-        alpha, beta = self._gate_raw
+        remove_h, remove_o, scale = self._gate_raw
         with torch.no_grad():
-            ah = alpha.float()
-            bh = beta.float()
+            rh = remove_h.float()
+            ro = remove_o.float()
             return {
-                "alpha_mean": ah.mean().item(),
-                "alpha_std": ah.std().item(),
-                "alpha_min": ah.min().item(),
-                "alpha_max": ah.max().item(),
-                "beta_mean": bh.mean().item(),
-                "beta_std": bh.std().item(),
-                "beta_min": bh.min().item(),
-                "beta_max": bh.max().item(),
-                "retain_dominant": (ah > 0.6).float().mean().item(),
-                "accept_dominant": (bh > 0.6).float().mean().item(),
+                "remove_h_mean": rh.mean().item(),
+                "remove_h_std": rh.std().item(),
+                "remove_h_abs_mean": rh.abs().mean().item(),
+                "remove_o_mean": ro.mean().item(),
+                "remove_o_std": ro.std().item(),
+                "remove_o_abs_mean": ro.abs().mean().item(),
+                "remove_scale": scale.item(),
+                "h_filtering": (rh > 0.1).float().mean().item(),
+                "o_filtering": (ro > 0.1).float().mean().item(),
+                "h_amplifying": (rh < -0.1).float().mean().item(),
+                "o_amplifying": (ro < -0.1).float().mean().item(),
             }
 
     @_gate_stats.setter
@@ -391,6 +407,10 @@ class AttnHiddenAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
+        # QK-Norm (same as Qwen3): RMSNorm on Q and K per head
+        self.q_norm = AttnHiddenRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = AttnHiddenRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
         self.rotary_emb = AttnHiddenRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
@@ -409,8 +429,8 @@ class AttnHiddenAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -493,11 +513,15 @@ class AttnHiddenDecoderLayer(GradientCheckpointingLayer):
         if self.use_residual_gate:
             num_heads = config.residual_gate_num_heads
             context_dim = config.residual_gate_context_dim
+            init_mode = getattr(config, 'residual_gate_init_mode', 'sft')
+            init_remove_scale = getattr(config, 'residual_gate_init_remove_scale', 0.1)
             self.attn_residual_gate = ResidualGate(
-                config.hidden_size, num_heads=num_heads, context_dim=context_dim
+                config.hidden_size, num_heads=num_heads, context_dim=context_dim,
+                init_mode=init_mode, init_remove_scale=init_remove_scale,
             )
             self.ffn_residual_gate = ResidualGate(
-                config.hidden_size, num_heads=num_heads, context_dim=context_dim
+                config.hidden_size, num_heads=num_heads, context_dim=context_dim,
+                init_mode=init_mode, init_remove_scale=init_remove_scale,
             )
 
     def forward(
@@ -567,6 +591,13 @@ class AttnHiddenPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
+        # ResidualGate and its children handle their own initialization
+        # in __init__ (LoRA-style for SFT, small random for pretrain).
+        # Skip any module that is or belongs to a ResidualGate.
+        if isinstance(module, ResidualGate):
+            return
+        if getattr(module, '_skip_init', False):
+            return
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -874,8 +905,9 @@ class AttnHiddenForCausalLM(AttnHiddenPreTrainedModel, GenerationMixin):
     def get_gate_stats(self) -> dict:
         """Collect ResidualGate statistics from all layers."""
         stats = {}
-        alpha_means = []
-        beta_means = []
+        remove_h_means = []
+        remove_o_means = []
+        scales = []
 
         for layer_idx, layer in enumerate(self.model.layers):
             if not layer.use_residual_gate:
@@ -890,12 +922,18 @@ class AttnHiddenForCausalLM(AttnHiddenPreTrainedModel, GenerationMixin):
                     for k, v in gs.items():
                         stats[f"{prefix}_{k}"] = v
 
-                    alpha_means.append(gs["alpha_mean"])
-                    beta_means.append(gs["beta_mean"])
+                    if "remove_h_mean" in gs:
+                        remove_h_means.append(gs["remove_h_mean"])
+                    if "remove_o_mean" in gs:
+                        remove_o_means.append(gs["remove_o_mean"])
+                    if "remove_scale" in gs:
+                        scales.append(gs["remove_scale"])
 
-        if alpha_means:
-            stats["gate/global_alpha_mean"] = sum(alpha_means) / len(alpha_means)
-        if beta_means:
-            stats["gate/global_beta_mean"] = sum(beta_means) / len(beta_means)
+        if remove_h_means:
+            stats["gate/global_remove_h_mean"] = sum(remove_h_means) / len(remove_h_means)
+        if remove_o_means:
+            stats["gate/global_remove_o_mean"] = sum(remove_o_means) / len(remove_o_means)
+        if scales:
+            stats["gate/global_remove_scale"] = sum(scales) / len(scales)
 
         return stats

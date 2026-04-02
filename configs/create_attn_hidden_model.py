@@ -84,6 +84,8 @@ def create_model(args):
         use_residual_gate=args.use_residual_gate,
         residual_gate_num_heads=args.residual_gate_num_heads,
         residual_gate_context_dim=args.residual_gate_context_dim,
+        residual_gate_init_mode=args.residual_gate_init_mode,
+        residual_gate_init_remove_scale=args.residual_gate_init_remove_scale,
         max_window_layers=args.max_window_layers,
         use_sliding_window=args.use_sliding_window,
         sliding_window=args.sliding_window,
@@ -207,6 +209,10 @@ def main():
     parser.add_argument('--head_dim', type=int, default=128)
     parser.add_argument('--residual_gate_num_heads', type=int, default=8)
     parser.add_argument('--residual_gate_context_dim', type=int, default=16)
+    parser.add_argument('--residual_gate_init_mode', type=str, default="pretrain",
+                        choices=["pretrain", "sft"],
+                        help="Gate init mode: 'pretrain' (small random) or 'sft' (K=zeros, h_new=h+o)")
+    parser.add_argument('--residual_gate_init_remove_scale', type=float, default=0.1)
     parser.add_argument('--max_position_embeddings', type=int, default=40960)
     parser.add_argument('--vocab_size', type=int, default=151936)
     parser.add_argument('--tie_word_embeddings', action='store_true', default=True)
