@@ -52,5 +52,5 @@ python configs/convert_qwen3_to_attn_hidden.py \
     --output_dir model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v11-sft
 
 # 训练（全参数 fine-tuning，Gate 参数 lr×5）
-bash configs/sft_attn_hidden.sh model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v11-sft 1 8
+bash configs/sft_attn_hidden.sh model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v11-sft 1 8   2>&1 | tee qwen3-0.6b-attn_hidden_20260403.log
 ```

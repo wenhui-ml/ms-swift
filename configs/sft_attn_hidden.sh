@@ -40,7 +40,7 @@ swift sft \
     --model_type qwen3 \
     --template qwen3 \
     --tuner_type full \
-    --dataset 'HuggingFaceH4/ultrachat_200k#100000' \
+    --dataset 'HuggingFaceH4/ultrachat_200k' \
     --torch_dtype bfloat16 \
     --num_train_epochs $MAX_EPOCHS \
     --per_device_train_batch_size 2 \
