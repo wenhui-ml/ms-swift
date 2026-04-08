@@ -1,21 +1,29 @@
 # Copyright (c) 2024. All rights reserved.
-# Attention Hidden-Size Transformer Configuration (V11)
+# Attention Hidden-Size Transformer Configuration (V12 — Independent Synaptic Gating)
 """Configuration for Attention Hidden-Size Transformer model.
 
-Qwen3-compatible architecture with Self-Attention Residual Gate:
-    h_new = α ⊙ h + β ⊙ o
+Qwen3-compatible architecture with Independent Synaptic Gating:
+    gate_forget  = σ(w_forget ⊙ RMSNorm(h) + b_forget)
+    gate_acquire = σ(w_acquire ⊙ RMSNorm(o) + b_acquire)
+    h_new = gate_forget ⊙ h + gate_acquire ⊙ o
 
-where α and β are computed via full self-attention over the hidden-size dimension:
-    Q = W_q · RMSNorm(h)         (content-dependent query)
-    K_h = W_kh · RMSNorm(h)      (h's key)
-    K_o = W_ko · RMSNorm(o)      (o's key)
-    score_h = Q · K_h             (per-head scalar score)
-    score_o = Q · K_o             (per-head scalar score)
-    [α, β] = softmax([score_h, score_o])  (competitive selection per head)
+RMSNorm inside the gate is parameter-free (no learnable weight), used solely
+to normalize activation magnitudes before gate computation. This prevents
+sigmoid saturation as hidden-state norms grow in deeper layers.
 
-Cross-layer information via gate_context propagated between layers.
+Each hidden dimension j ∈ {1…d} has its own independent scalar gate parameters,
+mimicking biological synaptic scaling: every "neuron" independently decides
+how much to retain (forget) and how much to accept (acquire) based solely
+on the signal flowing through itself.
 
-All linear layers are standard nn.Linear.
+Key properties:
+    - Pure element-wise operations (no matrix multiplication in the gate)
+    - Only 4d parameters per gate (w_forget, b_forget, w_acquire, b_acquire)
+    - Parameter-free RMSNorm stabilizes gate inputs regardless of depth
+    - Zero-loss fallback: init w=0, b=+4.0 → σ(4.0)≈0.98 → h_new ≈ h + o
+    - No cross-layer context needed
+    - No multi-head needed
+    - Biologically inspired: independent synaptic scaling per dimension
 """
 
 from transformers import PretrainedConfig
@@ -24,15 +32,16 @@ from transformers import PretrainedConfig
 class AttnHiddenConfig(PretrainedConfig):
     """Configuration class for Attention Hidden-Size Transformer.
 
-    This model is identical to Qwen3 except for the ResidualGate mechanism
+    This model is identical to Qwen3 except for the SynapticGate mechanism
     that replaces the standard additive residual connection (h + o) with
-    a self-attention-based gated combination: α⊙h + β⊙o.
+    independent element-wise gating: gate_forget⊙h + gate_acquire⊙o.
 
-    The gate uses full self-attention principles:
-    - Q = W_q · h (content-dependent, follows dynamic token content)
-    - K = W_k · h / W_k · o (content-dependent keys)
-    - Multi-head design for dimension-level granularity
-    - Cross-layer gate_context for depth-wise information flow
+    The gate uses independent per-dimension synaptic scaling:
+    - w_forget, b_forget ∈ ℝ^d — controls retention of residual stream h
+    - w_acquire, b_acquire ∈ ℝ^d — controls acceptance of new output o
+    - gate = σ(w ⊙ RMSNorm(x) + b) — sigmoid ensures gate values in [0, 1]
+    - RMSNorm is parameter-free (signal conditioning only, no learnable weight)
+    - No cross-channel interaction: each dimension is fully independent
 
     Args:
         vocab_size: Size of the vocabulary.
@@ -49,20 +58,16 @@ class AttnHiddenConfig(PretrainedConfig):
         use_cache: Whether to use KV cache.
         tie_word_embeddings: Whether to tie input/output embeddings.
         rope_theta: Base frequency for RoPE.
-        use_residual_gate: Whether to use ResidualGate (True) or standard add (False).
-        residual_gate_num_heads: Number of heads for the hidden-size attention gate.
-            Each head controls hidden_size // num_heads dimensions.
-        residual_gate_context_dim: Dimension of cross-layer gate context.
-            Set to 0 to disable cross-layer information.
-        residual_gate_lr_scale: Learning rate multiplier for gate parameters.
-        residual_gate_init_mode: Initialization mode for gate projections.
-            - "sft": LoRA-style init (K=zeros). Initial h_new = h + o exactly.
+        use_synaptic_gate: Whether to use SynapticGate (True) or standard add (False).
+        synaptic_gate_init_bias: Initial bias value for gate parameters.
+            σ(+4.0) ≈ 0.982 → h_new ≈ 0.98·h + 0.98·o ≈ h + o.
+            Higher values → closer to standard residual at init.
+        synaptic_gate_lr_scale: Learning rate multiplier for gate parameters.
+        synaptic_gate_init_mode: Initialization mode for gate weights.
+            - "sft": w=zeros, b=+init_bias → σ(bias)≈1 → h_new ≈ h+o exactly.
               Use when transferring weights from a pretrained Qwen3 model.
-            - "pretrain": All projections small random. Small initial perturbation.
+            - "pretrain": w=small random, b=+init_bias → h_new ≈ h+o + tiny noise.
               Use when training from scratch.
-        residual_gate_init_remove_scale: Initial value of the learnable removal
-            scale factor. Controls max removal per layer. Default 0.1 means
-            each layer can remove at most ~10% of h or o initially.
         attention_bias: Whether to use bias in attention projections.
         mlp_bias: Whether to use bias in MLP projections.
         attention_dropout: Dropout rate for attention.
@@ -86,13 +91,11 @@ class AttnHiddenConfig(PretrainedConfig):
         use_cache=True,
         tie_word_embeddings=True,
         rope_theta=1000000.0,
-        # === Attention Hidden-Size Gate specific ===
-        use_residual_gate=True,
-        residual_gate_num_heads=8,
-        residual_gate_context_dim=16,
-        residual_gate_lr_scale=5.0,
-        residual_gate_init_mode="sft",
-        residual_gate_init_remove_scale=0.1,
+        # === Independent Synaptic Gate specific ===
+        use_synaptic_gate=True,
+        synaptic_gate_init_bias=4.0,
+        synaptic_gate_lr_scale=5.0,
+        synaptic_gate_init_mode="sft",
         # === Qwen3-compatible metadata ===
         max_window_layers=28,
         sliding_window=None,
@@ -102,6 +105,13 @@ class AttnHiddenConfig(PretrainedConfig):
         attention_bias=False,
         mlp_bias=False,
         attention_dropout=0.0,
+        # === Legacy compatibility (ignored, kept for loading old configs) ===
+        use_residual_gate=None,
+        residual_gate_num_heads=None,
+        residual_gate_context_dim=None,
+        residual_gate_lr_scale=None,
+        residual_gate_init_mode=None,
+        residual_gate_init_remove_scale=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -117,13 +127,15 @@ class AttnHiddenConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        # Attention Hidden-Size Gate
-        self.use_residual_gate = use_residual_gate
-        self.residual_gate_num_heads = residual_gate_num_heads
-        self.residual_gate_context_dim = residual_gate_context_dim
-        self.residual_gate_lr_scale = residual_gate_lr_scale
-        self.residual_gate_init_mode = residual_gate_init_mode
-        self.residual_gate_init_remove_scale = residual_gate_init_remove_scale
+        # Independent Synaptic Gate
+        # Support legacy config: if use_residual_gate is set but use_synaptic_gate not explicitly given
+        if use_residual_gate is not None and use_synaptic_gate is True:
+            self.use_synaptic_gate = use_residual_gate
+        else:
+            self.use_synaptic_gate = use_synaptic_gate
+        self.synaptic_gate_init_bias = synaptic_gate_init_bias
+        self.synaptic_gate_lr_scale = synaptic_gate_lr_scale
+        self.synaptic_gate_init_mode = synaptic_gate_init_mode
         # Qwen3-compatible metadata
         self.max_window_layers = max_window_layers
         self.sliding_window = sliding_window

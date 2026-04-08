@@ -1,19 +1,10 @@
 #!/bin/bash
 # ============================================================================
-# Attention Hidden-Size Transformer V12 SFT 训练脚本
-# (Independent Synaptic Gating — 独立突触门控)
+# Attention Hidden-Size Transformer V11 SFT 训练脚本
 #
-# 非对称冻结训练（Asymmetric Frozen Tuning）：
-#   绝对冻结 Backbone 所有权重（Attention、MLP、Norm、Embedding），
-#   仅训练每层的 SynapticGate 参数（4d × 2 gates × N layers）。
-#
-# 公式：
-#   gate_forget  = σ(w_forget ⊙ RMSNorm(h) + b_forget)
-#   gate_acquire = σ(w_acquire ⊙ RMSNorm(o) + b_acquire)
-#   h_new = gate_forget ⊙ h + gate_acquire ⊙ o
-#
-# Gate 使用 SFT 初始化（w=0, b=+4.0 → σ(4.0)≈0.982 → h_new ≈ h+o），
-# 训练过程中每个维度独立学到选择性遗忘/获取信息。
+# 从 Qwen3 迁移权重后的 SFT 训练。
+# Gate 使用 LoRA 风格初始化（K=zeros → 初始 h_new = h+o），
+# 训练过程中 Gate 逐渐学到选择性过滤冗余/有害信息。
 #
 # 前置步骤：
 #   1. 先用 convert_qwen3_to_attn_hidden.py 从 Qwen3 迁移权重
@@ -22,28 +13,24 @@
 # Usage:
 #   # Step 1: 迁移权重
 #   python configs/convert_qwen3_to_attn_hidden.py \
-#       --qwen3_path /home/ubuntu/llm_weights/Qwen3-0.6B \
-#       --output_dir model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft
+#       --qwen3_path output/Qwen3-0.6B-standard/v1-20260326-020547/checkpoint-3500 \
+#       --output_dir model_checkpoints/attn_hidden-d1024-L28-v11-sft
 #
-#   # Step 2: SFT 训练（仅训练 gate 参数，backbone 冻结）
-#   bash configs/sft_attn_hidden.sh model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft 3 8
+#   # Step 2: SFT 训练
+#   bash configs/sft_attn_hidden.sh model_checkpoints/attn_hidden-d1024-L28-v11-sft 3500 8
 # ============================================================================
 
-MODEL_DIR=${1:-model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft}
+MODEL_DIR=${1:-/home/ubuntu/llm_weights/Qwen3-0.6B}
 MAX_EPOCHS=${2:-3}
 nproc_per_node=${3:-8}
 
 MODEL_NAME=$(basename $MODEL_DIR)
 
 echo "============================================"
-echo "Attention Hidden-Size V12 SFT Training"
-echo "  (Independent Synaptic Gating)"
-echo "  Mode: Asymmetric Frozen (gate-only)"
+echo "Qwen3-0.6B SFT Training"
 echo "  Model: $MODEL_DIR"
 echo "  Max Epochs: $MAX_EPOCHS"
 echo "  GPUs: $nproc_per_node"
-echo "  Backbone: FROZEN"
-echo "  Trainable: synaptic_gate params only"
 echo "============================================"
 
 NPROC_PER_NODE=$nproc_per_node \
@@ -53,14 +40,12 @@ swift sft \
     --model_type qwen3 \
     --template qwen3 \
     --tuner_type full \
-    --freeze_parameters_ratio 1.0 \
-    --trainable_parameters_regex 'synaptic_gate' \
     --dataset 'HuggingFaceH4/ultrachat_200k' \
     --torch_dtype bfloat16 \
     --num_train_epochs $MAX_EPOCHS \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
-    --learning_rate 1e-4 \
+    --learning_rate 1e-5 \
     --gradient_accumulation_steps 16 \
     --eval_steps 100 \
     --save_steps 100 \
@@ -69,7 +54,6 @@ swift sft \
     --deepspeed zero0 \
     --max_length 4096 \
     --warmup_ratio 0.05 \
-    --weight_decay 0.0 \
     --dataloader_num_workers 64 \
     --dataset_num_proc 64 \
     --save_only_model true \
@@ -78,5 +62,5 @@ swift sft \
     --use_hf true \
     --dataset_shuffle true \
     --train_dataloader_shuffle true \
-    --attn_impl flash_attn \
+    --attn_impl flash_attention_3 \
     --packing true

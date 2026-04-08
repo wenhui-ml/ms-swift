@@ -2,19 +2,21 @@
 """Create an Attention Hidden-Size Transformer checkpoint for pretraining.
 
 This creates a Qwen3-compatible model where every residual connection h = h + o
-is replaced by a full self-attention gate:
-    Q = W_q · h, K_h = W_kh · h, K_o = W_ko · o
-    score = Q · K → softmax → α, β
-    h_new = α ⊙ h + β ⊙ o
+is replaced by an Independent Synaptic Gate:
+    gate_forget  = σ(w_forget ⊙ RMSNorm(h) + b_forget)
+    gate_acquire = σ(w_acquire ⊙ RMSNorm(o) + b_acquire)
+    h_new = gate_forget ⊙ h + gate_acquire ⊙ o
+
+RMSNorm inside the gate is parameter-free (signal conditioning only).
 
 Usage:
     python create_attn_hidden_model.py \
         --hidden_size 1024 --intermediate_size 3072 --num_hidden_layers 28 \
         --num_attention_heads 16 --num_key_value_heads 8 --head_dim 128 \
         --vocab_size 151936 --max_position_embeddings 40960 \
-        --residual_gate_num_heads 8 --residual_gate_context_dim 16 \
+        --synaptic_gate_init_bias 4.0 \
         --torch_dtype bfloat16 \
-        --output_dir model_checkpoints/attn_hidden-d1024-L28-v11
+        --output_dir model_checkpoints/attn_hidden-d1024-L28-v12
 """
 
 import argparse
@@ -41,7 +43,7 @@ def count_parameters(model):
 def count_gate_parameters(model):
     gate_params = 0
     for name, p in model.named_parameters():
-        if 'residual_gate' in name:
+        if 'synaptic_gate' in name:
             gate_params += p.numel()
     return gate_params
 
@@ -81,11 +83,9 @@ def create_model(args):
         use_cache=True,
         tie_word_embeddings=args.tie_word_embeddings,
         rope_theta=1000000.0,
-        use_residual_gate=args.use_residual_gate,
-        residual_gate_num_heads=args.residual_gate_num_heads,
-        residual_gate_context_dim=args.residual_gate_context_dim,
-        residual_gate_init_mode=args.residual_gate_init_mode,
-        residual_gate_init_remove_scale=args.residual_gate_init_remove_scale,
+        use_synaptic_gate=args.use_synaptic_gate,
+        synaptic_gate_init_bias=args.synaptic_gate_init_bias,
+        synaptic_gate_init_mode=args.synaptic_gate_init_mode,
         max_window_layers=args.max_window_layers,
         use_sliding_window=args.use_sliding_window,
         sliding_window=args.sliding_window,
@@ -97,9 +97,10 @@ def create_model(args):
         attention_dropout=0.0,
     )
 
-    gate_status = "ON" if args.use_residual_gate else "OFF"
+    sig_val = torch.sigmoid(torch.tensor(args.synaptic_gate_init_bias)).item()
+    gate_status = "ON" if args.use_synaptic_gate else "OFF"
     print(f"\n{'='*60}")
-    print(f"Creating Attention Hidden-Size Transformer (gate={gate_status})")
+    print(f"Creating Attention Hidden-Size Transformer V12 (gate={gate_status})")
     print(f"{'='*60}")
     print(f"  hidden_size:           {config.hidden_size}")
     print(f"  intermediate_size:     {config.intermediate_size}")
@@ -107,10 +108,11 @@ def create_model(args):
     print(f"  num_attn_heads:        {config.num_attention_heads}")
     print(f"  num_kv_heads:          {config.num_key_value_heads}")
     print(f"  head_dim:              {config.head_dim}")
-    print(f"  use_residual_gate:     {config.use_residual_gate}")
-    if config.use_residual_gate:
-        print(f"  gate_num_heads:        {config.residual_gate_num_heads}")
-        print(f"  gate_context_dim:      {config.residual_gate_context_dim}")
+    print(f"  use_synaptic_gate:     {config.use_synaptic_gate}")
+    if config.use_synaptic_gate:
+        print(f"  gate_init_bias:        {config.synaptic_gate_init_bias} (σ≈{sig_val:.4f})")
+        print(f"  gate_init_mode:        {config.synaptic_gate_init_mode}")
+        print(f"  gate_params_per_gate:  4 × {config.hidden_size} = {4 * config.hidden_size:,}")
     print(f"  tie_embeddings:        {config.tie_word_embeddings}")
     print(f"  vocab_size:            {config.vocab_size}")
     print(f"  torch_dtype:           {config.torch_dtype}")
@@ -133,11 +135,11 @@ def create_model(args):
     print(f"  Trainable parameters:  {trainable_params:>12,}  ({trainable_params/1e6:.1f}M)")
     print(f"  Gate parameters:       {gate_params:>12,}  ({gate_params/1e6:.1f}M)")
     if total_params > 0:
-        print(f"  Gate overhead:         {gate_params / total_params * 100:.2f}%")
+        print(f"  Gate overhead:         {gate_params / total_params * 100:.3f}%")
 
     output_dir = args.output_dir
     if output_dir is None:
-        name = f"attn_hidden-d{args.hidden_size}-L{args.num_hidden_layers}-v11"
+        name = f"attn_hidden-d{args.hidden_size}-L{args.num_hidden_layers}-v12"
         output_dir = os.path.join(os.path.dirname(__file__), '..', 'model_checkpoints', name)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -200,25 +202,24 @@ def create_model(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create Attention Hidden-Size Transformer checkpoint")
+    parser = argparse.ArgumentParser(description="Create Attention Hidden-Size Transformer V12 checkpoint")
     parser.add_argument('--hidden_size', type=int, default=1024)
     parser.add_argument('--intermediate_size', type=int, default=None)
     parser.add_argument('--num_hidden_layers', type=int, default=28)
     parser.add_argument('--num_attention_heads', type=int, default=None)
     parser.add_argument('--num_key_value_heads', type=int, default=None)
     parser.add_argument('--head_dim', type=int, default=128)
-    parser.add_argument('--residual_gate_num_heads', type=int, default=8)
-    parser.add_argument('--residual_gate_context_dim', type=int, default=16)
-    parser.add_argument('--residual_gate_init_mode', type=str, default="pretrain",
+    parser.add_argument('--synaptic_gate_init_bias', type=float, default=4.0,
+                        help="Initial bias for gate (default 4.0, σ(4.0)≈0.982)")
+    parser.add_argument('--synaptic_gate_init_mode', type=str, default="pretrain",
                         choices=["pretrain", "sft"],
-                        help="Gate init mode: 'pretrain' (small random) or 'sft' (K=zeros, h_new=h+o)")
-    parser.add_argument('--residual_gate_init_remove_scale', type=float, default=0.1)
+                        help="Gate init mode: 'pretrain' (small random w) or 'sft' (w=zeros)")
     parser.add_argument('--max_position_embeddings', type=int, default=40960)
     parser.add_argument('--vocab_size', type=int, default=151936)
     parser.add_argument('--tie_word_embeddings', action='store_true', default=True)
     parser.add_argument('--no_tie_word_embeddings', dest='tie_word_embeddings', action='store_false')
-    parser.add_argument('--use_residual_gate', action='store_true', default=True)
-    parser.add_argument('--no_residual_gate', dest='use_residual_gate', action='store_false')
+    parser.add_argument('--use_synaptic_gate', action='store_true', default=True)
+    parser.add_argument('--no_synaptic_gate', dest='use_synaptic_gate', action='store_false')
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--tokenizer_from', type=str, default=None)
     parser.add_argument('--max_window_layers', type=int, default=28)

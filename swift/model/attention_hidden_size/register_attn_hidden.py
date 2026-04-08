@@ -11,7 +11,7 @@ import logging
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from swift.model.attention_hidden_size.configuration_attn_hidden import AttnHiddenConfig
-from swift.model.attention_hidden_size.modeling_attn_hidden import AttnHiddenForCausalLM, ResidualGate
+from swift.model.attention_hidden_size.modeling_attn_hidden import AttnHiddenForCausalLM, SynapticGate
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def inject_gate_monitor_callback(trainer, log_every_n_steps: int = 50,
     from transformers import TrainerCallback
 
     class AttnHiddenGateMonitorCallback(TrainerCallback):
-        """Monitor gate statistics during training."""
+        """Monitor SynapticGate statistics during training."""
 
         def __init__(self, log_every_n_steps=50, detail_every_n_steps=50):
             self.log_every_n_steps = log_every_n_steps
@@ -79,10 +79,10 @@ def inject_gate_monitor_callback(trainer, log_every_n_steps: int = 50,
 
             # Reset gate stats
             for layer in model.model.layers:
-                if hasattr(layer, 'attn_residual_gate'):
-                    layer.attn_residual_gate._gate_stats = None
-                if hasattr(layer, 'ffn_residual_gate'):
-                    layer.ffn_residual_gate._gate_stats = None
+                if hasattr(layer, 'attn_synaptic_gate'):
+                    layer.attn_synaptic_gate._gate_stats = None
+                if hasattr(layer, 'ffn_synaptic_gate'):
+                    layer.ffn_synaptic_gate._gate_stats = None
 
     for cb in trainer.callback_handler.callbacks:
         if isinstance(cb, AttnHiddenGateMonitorCallback):
