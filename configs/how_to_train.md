@@ -115,3 +115,152 @@ python configs/analyze_gates.py /path/to/checkpoint
 5. **RMSNorm 防深层饱和**：无参数 RMSNorm 确保 sigmoid 在任意深度有效工作
 6. **非对称冻结训练**：SFT 阶段冻结 backbone，仅训练 gate，信任交叉熵信号
 7. **无需反熵损失**：无需复杂的路由架构或辅助损失函数
+
+---
+
+## 20260408 更新：代码审查修复 & 完整训练流程
+
+### 本次修复清单
+
+| # | 问题 | 严重度 | 修复方式 |
+|---|------|--------|---------|
+| 1 | `SynapticGate` 缺少 RMSNorm | 🔴 Critical | 在 gate 内添加无参数 `_rms_norm_no_weight()` |
+| 2 | SFT 脚本未冻结 backbone | 🔴 Critical | 添加 `--freeze_parameters_ratio 1.0 --trainable_parameters_regex 'synaptic_gate'` |
+| 3 | 所有文档公式缺少 RMSNorm | 🟡 Medium | 全部更新为 `σ(w ⊙ RMSNorm(x) + b)` |
+| 4 | `scripts/inspect_gate_values.py` 为 V11 遗留 | 🟡 Medium | 已删除（被 `configs/analyze_gates.py` 取代） |
+| 5 | `swift/optimizers/attn_hidden.py` 为 V11 遗留 | 🟡 Medium | 更新为 V12 命名 (`synaptic_gate`)，注册到 `optimizers_map` |
+| 6 | 预训练脚本未使用 gate 专用优化器 | 🟢 Low | `pt_attn_hidden.sh` 添加 `--optimizer attn_hidden` |
+
+### 修复后的核心公式
+
+```python
+# 无参数 RMSNorm（仅归一化，无可学习 weight）
+def _rms_norm_no_weight(x, eps=1e-6):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+# 门控计算（在归一化后的空间中）
+normed_h = _rms_norm_no_weight(h)
+normed_o = _rms_norm_no_weight(o)
+gate_forget  = σ(w_forget ⊙ normed_h + b_forget)
+gate_acquire = σ(w_acquire ⊙ normed_o + b_acquire)
+
+# 最终组合（在原始空间中）
+h_new = gate_forget ⊙ h + gate_acquire ⊙ o
+```
+
+关键：RMSNorm 只用于 gate 的 sigmoid 输入，最终的 hadamard 乘积用的是**原始** h 和 o。
+
+### 修复后的完整文件清单
+
+| 文件 | 说明 | 20260408 状态 |
+|------|------|--------------|
+| `swift/model/attention_hidden_size/modeling_attn_hidden.py` | 核心模型（SynapticGate + RMSNorm） | ✅ 修复 |
+| `swift/model/attention_hidden_size/configuration_attn_hidden.py` | 配置类 | ✅ 修复 |
+| `swift/model/attention_hidden_size/__init__.py` | 模块导出 | ✅ 无需修改 |
+| `swift/model/attention_hidden_size/register_attn_hidden.py` | HuggingFace 注册 + gate monitor | ✅ 无需修改 |
+| `swift/optimizers/attn_hidden.py` | Gate 专用优化器（gate 5x LR） | ✅ V11→V12 更新 |
+| `swift/optimizers/mapping.py` | 优化器注册表 | ✅ 新增 attn_hidden |
+| `configs/create_attn_hidden_model.py` | 创建模型（从头） | ✅ 文档修复 |
+| `configs/convert_qwen3_to_attn_hidden.py` | 从 Qwen3 迁移权重 | ✅ 文档修复 |
+| `configs/analyze_gates.py` | 分析门控统计信息 | ✅ 文档修复 |
+| `configs/pt_attn_hidden.sh` | 预训练脚本 | ✅ 添加 `--optimizer attn_hidden` |
+| `configs/sft_attn_hidden.sh` | SFT 训练脚本（非对称冻结） | ✅ 修复冻结策略 |
+| `configs/sft_attn_hidden_v2.sh` | SFT 训练脚本 V2 | ✅ 修复冻结策略 |
+| ~~`scripts/inspect_gate_values.py`~~ | ~~V11 遗留检查脚本~~ | ❌ 已删除 |
+
+### 完整训练步骤
+
+#### 方式 A：从头预训练（适合研究探索）
+
+```bash
+cd /home/ubuntu/wenhui/mag_gate/ms-swift
+
+# Step 1: 创建随机初始化的模型
+python configs/create_attn_hidden_model.py \
+    --hidden_size 1024 \
+    --intermediate_size 3072 \
+    --num_hidden_layers 28 \
+    --num_attention_heads 16 \
+    --num_key_value_heads 8 \
+    --head_dim 128 \
+    --synaptic_gate_init_mode pretrain \
+    --synaptic_gate_init_bias 4.0 \
+    --tokenizer_from /home/ubuntu/llm_weights/Qwen3-0.6B/ \
+    --output_dir model_checkpoints/attn_hidden-d1024-L28-v12
+
+# Step 2: 预训练（backbone + gate 全部可训练，gate 用 5x LR）
+#   --optimizer attn_hidden: gate 参数自动分组，使用 base_lr × 5 和 weight_decay=0
+bash configs/pt_attn_hidden.sh model_checkpoints/attn_hidden-d1024-L28-v12 3500 8
+
+# Step 3: 分析门控学到了什么
+python configs/analyze_gates.py output/attn_hidden-d1024-L28-v12/checkpoint-latest
+```
+
+#### 方式 B：从 Qwen3 迁移权重 + SFT（推荐，节省训练成本）
+
+```bash
+cd /home/ubuntu/wenhui/mag_gate/ms-swift
+
+# Step 1: 从 Qwen3 迁移权重
+#   - 所有 Attention/MLP/Norm/Embedding 权重直接复制
+#   - Gate 用 SFT 初始化：w=0, b=+4.0 → σ(0·RMSNorm(x)+4.0)=σ(4.0)≈0.982 → h_new ≈ h+o
+python configs/convert_qwen3_to_attn_hidden.py \
+    --qwen3_path /home/ubuntu/llm_weights/Qwen3-0.6B \
+    --output_dir model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft \
+    --synaptic_gate_init_bias 4.0
+
+# Step 2: SFT 训练（非对称冻结训练）
+#   - backbone 完全冻结（--freeze_parameters_ratio 1.0）
+#   - 仅 synaptic_gate 解冻（--trainable_parameters_regex 'synaptic_gate'）
+#   - weight_decay=0.0（gate 参数不正则化）
+#   - 较高 LR（1e-4）因为仅训练 ~0.04% 的参数
+bash configs/sft_attn_hidden.sh model_checkpoints/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft 3 8
+
+# Step 3: 分析门控学到了什么
+python configs/analyze_gates.py output/qwen3-0.6b-attn_hidden-d1024-L28-v12-sft/checkpoint-latest
+```
+
+#### 方式 B-V2：改进版 SFT（更细粒度）
+
+```bash
+# 使用 V2 脚本：gradient_accumulation=8, warmup=0.10, lr=5e-4, flash_attention_3
+bash configs/sft_attn_hidden_v2.sh model_checkpoints/qwen3-0.6b-attn_hidden-v12-v2 3 8
+```
+
+### 训练策略对比表
+
+| 参数 | 预训练 (`pt_attn_hidden.sh`) | SFT v1 (`sft_attn_hidden.sh`) | SFT v2 (`sft_attn_hidden_v2.sh`) |
+|------|-------|------|------|
+| backbone | ✅ 可训练 | ❄️ 冻结 | ❄️ 冻结 |
+| gate | ✅ 可训练 (5x LR) | ✅ 可训练 | ✅ 可训练 |
+| optimizer | `attn_hidden` (分组 LR) | default | default |
+| freeze_ratio | 0 | 1.0 | 1.0 |
+| trainable_regex | — | `synaptic_gate` | `synaptic_gate` |
+| learning_rate | 1e-4 | 1e-4 | 5e-4 |
+| weight_decay | 0.1 (backbone only) | 0.0 | 0.0 |
+| gradient_accum | 16 | 16 | 8 |
+| warmup | 0.05 | 0.05 | 0.10 |
+| attn_impl | flash_attention_3 | flash_attn | flash_attention_3 |
+| gate_init_mode | pretrain | sft | sft |
+
+### 关键运行验证
+
+```bash
+# 验证 gate 输出正确性（零损失退化测试）
+python -c "
+import torch
+from swift.model.attention_hidden_size import SynapticGate
+gate = SynapticGate(1024, init_bias=4.0, init_mode='sft')
+h, o = torch.randn(2, 10, 1024), torch.randn(2, 10, 1024)
+result = gate(h, o)
+expected = torch.sigmoid(torch.tensor(4.0)) * h + torch.sigmoid(torch.tensor(4.0)) * o
+print(f'Max diff: {(result - expected).abs().max():.2e}')  # Should be 0.00e+00
+"
+
+# 验证优化器注册
+python -c "
+from swift.optimizers.mapping import optimizers_map
+assert 'attn_hidden' in optimizers_map
+print('Registered:', list(optimizers_map.keys()))
+"
+```
